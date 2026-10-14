@@ -1,0 +1,749 @@
+---
+title: "GCA proteomic prediction model"
+author:
+  - Ben Whittle
+date: now
+date-format: DD-MM-YY HH:mm
+format:
+  html:
+    toc: true
+    toc-depth: 1
+    smooth-scroll: true
+    code-fold: false
+    fig-dpi: 300
+    embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    dev: ragg_png
+execute:
+  warning: false
+---
+
+```{r}
+library(here)
+library(arrow)
+library(nestedcv)
+library(pROC)
+library(tidyverse)
+library(ggtext)
+library(patchwork)
+library(broom)
+library(ragg)
+
+
+source(here("functions.R"))
+theme_set(figTheme())
+figs <- list()
+```
+
+Import
+```{r}
+meta <- readRDS(here("00_setup/data/metadata.samples.postQC.rds"))
+analytes <- readRDS(here("00_setup/data/metadata.analytes.rds"))
+model <- readRDS(here("04_prediction_model/data/nestedcv.rds"))
+counts <- read_parquet(here("00_setup/data/count_tidy.postQC.parquet"))
+```
+
+# Summary
+```{r}
+model$summary
+```
+
+# Held-out predictions
+
+```{r fig.height=4, fig.width=4}
+test_predictions_refdx <- map(1:nrow(meta), \(x) {
+  model$outer_result[[x]]$preds
+}) %>%
+  list_rbind() %>%
+  rownames_to_column("study_id") %>%
+  left_join(meta[, c("study_id", "ref_dx")], by = "study_id") %>%
+  mutate(ref_dx = fct_recode(ref_dx, "non-GCA" = "not_cGCA", "GCA" = "cGCA"))
+(figs$test_predictions_refdx <- test_predictions_refdx %>%
+  ggplot(aes(x = ref_dx, y = predyp)) +
+  geom_jitter(aes(colour = ref_dx), width = 0.25) +
+  geom_boxplot(alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  geom_richtext(
+    data = tidy(wilcox.test(predyp ~ ref_dx, data = test_predictions_refdx)),
+    aes(
+      x = 1.5,
+      y = Inf,
+      vjust = 0.75,
+      label = paste0(formatPvalLabel(p.value))
+    ),
+    size = 3.5,
+    fill = NA,
+    label.color = NA
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  coord_cartesian(clip = "off") +
+  scale_colour_manual(values = col.dx) +
+  labs(x = NULL, y = "Prediction score", title = "Held-out predictions") +
+  theme(legend.position = "none"))
+```
+
+Group medians
+```{r}
+test_predictions_refdx %>%
+  summarise(median = round(median(predyp), 2), .by = ref_dx)
+```
+
+
+# ROC + AUC
+```{r fig.height=3, fig.width=3}
+auc_95ci <- ci.auc(model$roc)
+
+(figs$test_roc <- tidyROC(model$roc) %>%
+  ggplot(aes(x = specificity, y = sensitivity)) +
+  annotate(
+    "segment",
+    x = 1,
+    xend = 0,
+    y = 0,
+    yend = 1,
+    color = "grey",
+    linetype = "dashed"
+  ) +
+  geom_path(linewidth = 0.5, colour = "red") +
+  annotate(
+    geom = "text",
+    label = paste0(
+      "AUC: ",
+      round(auc_95ci[2], 2),
+      " (",
+      round(auc_95ci[1], 2),
+      "-",
+      round(auc_95ci[3], 2),
+      ")"
+    ),
+    x = -Inf,
+    y = -Inf,
+    hjust = 1,
+    vjust = -1,
+    size = 3.5
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_reverse() +
+  labs(
+    x = "Specificity",
+    y = "Sensitivity",
+  ))
+```
+
+
+# Model coefficients + importance
+```{r fig.height=7, fig.width=10}
+predictor_df <- var_stability(model, percent = TRUE) %>%
+  rownames_to_column("apt_id") %>%
+  left_join(analytes[, c("apt_id", "apt_label")], by = "apt_id") %>%
+  filter(final == "yes") %>%
+  mutate(direction = str_to_title(direction))
+
+(figs$model_predictors <- ggplot(
+  predictor_df,
+  aes(y = frequency, x = fct_reorder(apt_label, mean))
+) +
+  geom_col(aes(fill = frequency)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 112)) +
+  scale_x_discrete(limits = rev) +
+  scale_fill_distiller(palette = "Purples", direction = 1) +
+  labs(y = "Inclusion frequency", fill = "Frequency", x = NULL) +
+  figTheme("box") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(10, 10, 10, 20)
+  ) +
+  ggplot(predictor_df, aes(y = mean, x = fct_reorder(apt_label, mean))) +
+  ggstats::geom_stripped_cols() +
+  geom_pointrange(aes(
+    ymin = mean - sem,
+    ymax = mean + sem,
+    colour = direction,
+    shape = direction
+  )) +
+  labs(
+    y = "Variable importance (%)",
+    x = NULL,
+    shape = "Coefficient sign",
+    colour = "Coefficient sign"
+  ) +
+  scale_colour_manual(
+    values = c("Positive" = "#B53737FF", "Negative" = "#00344AFF")
+  ) +
+  scale_x_discrete(guide = guide_axis(angle = 45), limits = rev) +
+  figTheme("box") +
+  theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 1),
+    legend.background = element_blank(),
+    legend.box.background = element_rect(size = 0.5)
+  ) +
+  plot_layout(heights = c(1, 2)))
+```
+How many predictors in final model?
+```{r}
+nrow(model$final_coef[-1, ]) # exclude first row which is the intercept
+```
+Export final model coefficients
+```{r}
+model$final_coef |>
+  rownames_to_column("apt_id") |>
+  select(apt_id, coefficient = coef) |>
+  write_csv(here("supp_data/model_coefficients.csv"))
+```
+
+
+---
+
+# GCA validation
+External C-GCA validation
+Generalisability to remission
+Generalisability to LV-GCA
+
+```{r}
+cunningham <- list()
+cunningham$predictions <- readRDS(here(
+  "04_prediction_model/data/cunningham.predictions.rds"
+))
+cunningham$meta <- readRDS(here("04_prediction_model/data/cunningham.meta.rds"))
+
+cunningham$predictions <- cunningham$predictions %>%
+  left_join(cunningham$meta, by = c("unique_id", "dx")) %>%
+  mutate(study_group = str_to_title(study_group))
+
+# set GCA classification to be Control for Controls
+cunningham$predictions <- cunningham$predictions %>%
+  mutate(
+    gca_classification = if_else(
+      study_group == "Control",
+      "Control",
+      gca_classification
+    )
+  )
+
+# set colours for Control, Active and Inactive
+colours_gca <- c(
+  "Control" = "#E69F00",
+  "Active" = "#0072B2",
+  "Inactive" = "#56B4E9"
+)
+```
+
+Collect ROC thresholds and AUCs (95% CIs)
+```{r}
+tmp <- map(c("Active", "Inactive"), function(x) {
+  roc_obj <- roc(
+    study_group ~ prediction,
+    data = cunningham$predictions %>% filter(study_group %in% c(x, "Control")),
+    levels = c("Control", x)
+  )
+  rocs <- tidyROC(roc_obj) %>% mutate(study_group = x)
+  aucs <- tidyAUC(roc_obj) %>% mutate(study_group = x)
+  return(list(roc = rocs, auc = aucs))
+}) %>%
+  set_names(c("Active", "Inactive"))
+
+cunningham$auc <- map(names(tmp), \(x) pluck(tmp, x, "auc")) %>% list_rbind()
+cunningham$roc <- map(names(tmp), \(x) pluck(tmp, x, "roc")) %>% list_rbind()
+```
+Model predictions
+```{r fig.height=2, fig.width=3}
+figs$gca$predictions <- cunningham$predictions %>%
+  mutate(
+    study_group = factor(
+      study_group,
+      levels = c("Control", "Active", "Inactive")
+    ),
+    study = "GCA<br>Cunningham et al., 2024"
+  ) %>%
+  ggplot(aes(x = study_group, y = prediction)) +
+  geom_jitter(aes(colour = study_group), width = 0.25) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA, width = 0.5) +
+  #stat_summary(fun = "median", width = 0.25, size = 0.25, geom = "crossbar") +
+  geom_richtext(
+    data = map(c("Active", "Inactive"), \(x) {
+      tidy(wilcox.test(
+        prediction ~ study_group,
+        data = cunningham$predictions %>%
+          filter(study_group %in% c("Control", x))
+      )) %>%
+        mutate(study_group = x)
+    }) %>%
+      list_rbind() %>%
+      mutate(
+        bonf_p = p.adjust(p.value, method = "bonferroni"),
+        bonf_label = map_chr(bonf_p, formatPvalLabel)
+      ),
+    aes(x = study_group, y = Inf, vjust = 0.5, label = bonf_label),
+    size = 3,
+    fill = NA,
+    label.color = NA
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Disease activity", y = "GCA prediction score") +
+  facet_wrap(~study) +
+  scale_colour_manual(values = colours_gca) +
+  theme(legend.position = "none")
+figs$gca$predictions
+```
+
+Group medians
+```{r}
+cunningham$predictions %>%
+  summarise(median = round(median(prediction), 2), .by = study_group)
+```
+
+
+
+ROC curve
+```{r fig.height=3, fig.width=3}
+figs$gca$roc <- cunningham$roc %>%
+  ggplot(aes(x = specificity, y = sensitivity)) +
+  annotate(
+    "segment",
+    x = 1,
+    xend = 0,
+    y = 0,
+    yend = 1,
+    color = "grey",
+    linetype = "dashed"
+  ) +
+  geom_path(aes(colour = study_group), linewidth = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_colour_manual(
+    values = colours_gca,
+    labels = c(
+      "Active" = paste0(
+        "Active = ",
+        cunningham$auc %>%
+          filter(study_group == "Active") %>%
+          pull(auc) %>%
+          round(., 2),
+        " (",
+        cunningham$auc %>%
+          filter(study_group == "Active") %>%
+          pull(conf_lower) %>%
+          round(., 2),
+        "-",
+        cunningham$auc %>%
+          filter(study_group == "Active") %>%
+          pull(conf_higher) %>%
+          round(., 2),
+        ")"
+      ),
+      "Inactive" = paste0(
+        "Inactive = ",
+        cunningham$auc %>%
+          filter(study_group == "Inactive") %>%
+          pull(auc) %>%
+          round(., 2),
+        " (",
+        cunningham$auc %>%
+          filter(study_group == "Inactive") %>%
+          pull(conf_lower) %>%
+          round(., 2),
+        "-",
+        cunningham$auc %>%
+          filter(study_group == "Inactive") %>%
+          pull(conf_higher) %>%
+          round(., 2),
+        ")"
+      )
+    )
+  ) +
+  scale_x_reverse() +
+  labs(
+    x = "Specificity",
+    y = "Sensitivity",
+    colour = "AUC"
+  ) +
+  theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.title = element_markdown(hjust = 0.5, size = 9)
+    #legend.box.background = element_rect()
+  )
+figs$gca$roc
+```
+### GCA subtypes - cranial vs large-vessel
+
+N samples in each group
+```{r}
+cunningham$predictions %>% count(dx)
+```
+
+
+
+Plot predictions
+```{r fig.height=3, fig.width=5}
+figs$gca$predictions_study_group <- cunningham$predictions %>%
+  ggplot(aes(x = study_group, y = prediction)) +
+  facet_grid(
+    ~ factor(
+      gca_classification,
+      levels = c(NA, "Cranial", "LV"),
+      labels = c("Cranial" = "Cranial GCA", "LV" = "Large-vessel GCA")
+    ),
+    scales = "free_x",
+    space = "free"
+  ) +
+  geom_jitter(aes(colour = study_group), width = 0.25) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.5) +
+  #stat_summary(fun = "median", width = 0.25, size = 0.25, geom = "crossbar") +
+  geom_richtext(
+    data = expand_grid(
+      type = c("Cranial", "LV"),
+      group = c("Active", "Inactive")
+    ) %>%
+      pmap(\(type, group) {
+        tidy(wilcox.test(
+          prediction ~ dx,
+          data = cunningham$predictions %>%
+            filter(
+              gca_classification %in% c("Control", type),
+              study_group %in% c("Control", group)
+            )
+        )) %>%
+          mutate(
+            gca_classification = type,
+            study_group = group,
+            bonf_label = map_chr(
+              p.adjust(p.value, method = "bonferroni"),
+              formatPvalLabel
+            )
+          )
+      }) %>%
+      list_rbind(),
+    aes(x = study_group, y = Inf, vjust = 0.75, label = bonf_label),
+    size = 3,
+    fill = NA,
+    label.color = NA
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  coord_cartesian(clip = "off") +
+  labs(x = NULL, y = "GCA prediction score", colour = "Disease activity") +
+  scale_colour_manual(values = colours_gca)
+figs$gca$predictions_study_group
+```
+Calculate ROC curves and AUC
+```{r}
+gca_subtype_roc <- map(
+  c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"),
+  \(x) {
+    roc_obj <- roc(
+      dx ~ prediction,
+      data = cunningham$predictions %>% filter(dx %in% c(x, "Control_NA")),
+      levels = c("Control_NA", x)
+    )
+    rocs <- tidyROC(roc_obj) %>% mutate(dx = x)
+    aucs <- tidyAUC(roc_obj) %>% mutate(dx = x)
+    list(roc = rocs, auc = aucs)
+  }
+) %>%
+  set_names(c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"))
+```
+
+```{r}
+map(c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"), \(x) {
+  pluck(gca_subtype_roc, x, "auc")
+}) |>
+  list_rbind()
+```
+
+
+ROC curves
+```{r}
+# ROC plot
+(figs$gca_subtype_roc <- map(
+  c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"),
+  \(x) pluck(gca_subtype_roc, x, "roc")
+) %>%
+  list_rbind() %>%
+  separate_wider_delim(
+    cols = dx,
+    names = c("study_group", "gca_classification"),
+    delim = "_"
+  ) %>%
+  mutate(study_group = str_to_title(study_group)) %>%
+  ggplot(aes(x = specificity, y = sensitivity)) +
+  annotate(
+    "segment",
+    x = 1,
+    xend = 0,
+    y = 0,
+    yend = 1,
+    color = "grey",
+    linetype = "dashed"
+  ) +
+  geom_path(aes(colour = study_group), linewidth = 0.5) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_colour_manual(values = colours_gca) +
+  scale_x_reverse() +
+  facet_wrap(
+    ~ factor(
+      gca_classification,
+      levels = c("Cranial", "LV"),
+      labels = c("Cranial" = "Cranial GCA", "LV" = "Large-vessel GCA")
+    )
+  ) +
+  labs(
+    x = "Specificity",
+    y = "Sensitivity",
+    colour = "Disease activity"
+  )) +
+  theme(panel.spacing = unit(1, "lines"))
+```
+
+AUC
+```{r}
+(figs$gca_subtype_auc <- map(
+  c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"),
+  \(x) pluck(gca_subtype_roc, x, "auc")
+) %>%
+  list_rbind() %>%
+  separate_wider_delim(
+    cols = dx,
+    names = c("study_group", "gca_classification"),
+    delim = "_"
+  ) %>%
+  mutate(study_group = str_to_title(study_group)) %>%
+  ggplot(aes(y = study_group, x = auc)) +
+  geom_pointrange(aes(
+    xmin = conf_lower,
+    xmax = conf_higher,
+    colour = study_group
+  )) +
+  facet_grid(
+    ~ factor(
+      gca_classification,
+      levels = c("Cranial", "LV"),
+      labels = c("Cranial" = "Cranial GCA", "LV" = "Large-vessel GCA")
+    ),
+    scales = "free_y",
+    space = "free"
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        round(auc, 2),
+        " (",
+        round(conf_lower, 2),
+        "-",
+        round(conf_higher, 2),
+        ")"
+      )
+    ),
+    vjust = -1,
+    hjust = 1,
+    size = 3
+  ) +
+  scale_colour_manual(values = colours_gca) +
+  scale_x_continuous(limits = c(0.5, 1)) +
+  labs(y = NULL, x = "AUC (95% CI)", colour = "Disease activity")) +
+  theme(panel.spacing = unit(1, "lines"))
+```
+AUCs
+```{r}
+map(c("active_Cranial", "inactive_Cranial", "active_LV", "inactive_LV"), \(x) {
+  pluck(gca_subtype_roc, x, "auc")
+}) %>%
+  list_rbind() %>%
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+
+
+Assemble into supp figure
+
+```{r fig.height=6.5, fig.width=8.5}
+(figs$gca$predictions_study_group) /
+       ((figs$gca_subtype_roc | figs$gca_subtype_auc) +
+              plot_layout(widths = c(1, 1))) +
+       plot_annotation(tag_levels = "a") &
+       theme(legend.position = "bottom")
+
+ggsave(
+       here("figures/annotated/supp_gca_subgroup_predictions.png"),
+       height = 6.5,
+       width = 8.5,
+       dpi = 600,
+       device = agg_png
+)
+```
+
+
+---
+
+# Disease controls
+```{r}
+covid <- list()
+covid$predictions <- readRDS(here(
+  "04_prediction_model/data/gisby.predictions.rds"
+)) %>%
+  # recode as covid + or - %>%
+  mutate(
+    group = if_else(WHO_severity == "negative", "Negative", "Positive")
+  ) %>%
+  select(!WHO_severity) %>%
+  rename(study_id = sample_id)
+
+sle <- list()
+sle$predictions <- read_parquet(here(
+  "04_prediction_model/data/sle.prediction.parquet"
+))
+
+# project back onto full TABUL cohort
+tabul_predictions <- data.frame(
+  prediction = predict(
+    model,
+    newdata = counts %>%
+      filter(apt_id %in% row.names(model$final_coef)) %>%
+      pivot_wider(
+        id_cols = study_id,
+        names_from = apt_id,
+        values_from = log2_RFU
+      ) %>%
+      column_to_rownames("study_id"),
+    type = "response"
+  )
+) %>%
+  rename(prediction = 1) %>%
+  rownames_to_column("study_id") %>%
+  left_join(meta[, c("study_id", "ref_dx")], by = "study_id") %>%
+  rename(group = ref_dx) %>%
+  mutate(study = "TABUL")
+```
+
+```{r fig.height=3,  fig.width=6}
+figs$disease_controls <- bind_rows(
+  sle$prediction %>%
+    mutate(study = "SLE<br>Leung et al., 2026") %>%
+    rename(study_id = SampleId, group = Group)
+) %>%
+  bind_rows(covid$prediction %>% mutate(study = "ESKD<br>Gisby et al., 2022"))
+
+(figs$disease_controls <- figs$disease_controls %>%
+  mutate(
+    group = case_match(
+      group,
+      "Negative" ~ paste0(
+        "SARS-CoV2\nNegative\n(n = ",
+        nrow(filter(figs$disease_controls, group == "Negative")),
+        ")"
+      ),
+      "Positive" ~ paste0(
+        "SARS-CoV2\nPositive\n(n = ",
+        nrow(filter(figs$disease_controls, group == "Positive")),
+        ")"
+      ),
+      "Healthy" ~ paste0(
+        "Control\n(n = ",
+        nrow(filter(figs$disease_controls, group == "Healthy")),
+        ")"
+      ),
+      "SLE" ~ paste0(
+        "SLE\n(n = ",
+        nrow(filter(figs$disease_controls, group == "SLE")),
+        ")"
+      ),
+      .default = group
+    )
+  ) %>%
+  ggplot(aes(x = group, y = prediction)) +
+  geom_jitter(width = 0.25, colour = "grey") +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA, width = 0.5) +
+  stat_summary(fun = "median", width = 0.25, size = 0.25, geom = "crossbar") +
+  scale_y_continuous(limits = c(0, 1)) +
+  facet_grid(
+    ~ factor(
+      study,
+      levels = c(
+        "TABUL",
+        "ESKD<br>Gisby et al., 2022",
+        "SLE<br>Leung et al., 2026"
+      )
+    ),
+    space = "free",
+    scale = "free_x"
+  ) +
+  labs(x = NULL, y = "GCA prediction score"))
+```
+```{r}
+bind_rows(
+  sle$prediction %>%
+    mutate(study = "SLE<br>Leung et al., 2026") %>%
+    rename(study_id = SampleId, group = Group)
+) %>%
+  bind_rows(
+    covid$prediction %>% mutate(study = "ESKD<br>Gisby et al., 2022")
+  ) %>%
+  summarise(median = round(median(prediction), 4), .by = c(group, study))
+```
+
+---
+
+# figure panel
+
+```{r fig.height=10, fig.width=11}
+p1 <- plot_spacer() +
+  figs$test_predictions_refdx +
+  figs$test_roc +
+  plot_layout(widths = c(1.75, 1, 1))
+p2 <- figs$model_predictors
+p3 <- (figs$gca$predictions | figs$gca$roc | figs$disease_controls) +
+  plot_layout(widths = c(1.2, 1, 1.75))
+
+
+p1 / p2 / p3 + plot_layout(heights = c(1, 1.5, 1))
+
+ggsave(here("figures/raw/main_model.pdf"), height = 10, width = 11)
+```
+
+### Source data
+Main
+
+```{r}
+#5b
+figs$test_predictions_refdx$data |>
+  select(ref_dx, prediction_score = predyp) |>
+  write_csv(here("figures/source_data/5b.csv"))
+#5c
+figs$test_roc$data |> write_csv(here("figures/source_data/5c.csv"))
+#5d
+predictor_df |> write_csv(here("figures/source_data/5d.csv"))
+#5e
+figs$gca$predictions$data |>
+  select(unique_id, prediction_score = prediction, study_group) |>
+  write_csv(here("figures/source_data/5e.csv"))
+#5f
+figs$gca$roc$data |> write_csv(here("figures/source_data/5f.csv"))
+#5g
+figs$disease_controls$data |>
+  rename(prediction_score = prediction) |>
+  write_csv(here("figures/source_data/5g.csv"))
+```
+
+
+Supp
+
+```{r}
+#S8a
+figs$gca$predictions_study_group$data |>
+  select(
+    unique_id,
+    prediction_score = prediction,
+    study_group,
+    gca_classification
+  ) |>
+  write_csv(here("figures/source_data/S8a.csv"))
+#S8b
+figs$gca_subtype_roc$data |> write_csv(here("figures/source_data/S8b.csv"))
+#S8c
+figs$gca_subtype_auc$data |> write_csv(here("figures/source_data/S8c.csv"))
+```

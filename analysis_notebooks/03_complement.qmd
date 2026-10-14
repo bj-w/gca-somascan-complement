@@ -1,0 +1,405 @@
+---
+title: "Complement"
+author:
+  - Ben Whittle
+date: now
+date-format: DD-MM-YY HH:mm
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    smooth-scroll: true
+    code-fold: false
+    code-tools: true
+    fig-dpi: 300
+    embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    dev: ragg_png
+execute:
+  warning: false
+---
+
+```{r}
+library(here)
+library(arrow)
+library(ragg)
+library(tidyverse)
+library(patchwork)
+library(broom)
+library(ggforce)
+
+source(here("functions.R"))
+theme_set(figTheme())
+
+figs <- list()
+
+targets <- list()
+targets$order <- c("C3a", "C5a", "sC5b9", "fB", "fH", "CFHR5")
+targets$labels <- c("C3a" = "C3a", "C5a" = "C5a", "sC5b9" = "sC5b-9", "fB" = "Factor B", "fH" = "Factor H", "CFHR5" = "CFHR5")
+```
+
+
+---
+
+# Soma
+
+Import
+```{r}
+soma_info <- readRDS(here("00_setup/data/metadata.analytes.rds"))
+tidy_counts <- read_parquet(here("00_setup/data/count_tidy.postQC.parquet"))
+soma_res <- read_csv(here("01_differential_abundance/data/limma.ref_dx.csv"))
+# complement soma IDs
+complement_soma <- read_csv(here("03_complement/data/complement_somamer_ids.csv")) %>%
+  left_join(soma_res,by="apt_id")
+```
+
+N SOMAmers
+```{r}
+nrow(complement_soma)
+```
+```{r}
+complement_soma$Target %>% unique() %>% length()
+```
+
+## Differential abundance of complement proteins measured via somascan
+
+```{r fig.height=8, fig.width=10}
+# combine
+complement_sum_stats <- complement_soma %>%
+  mutate(target_label=paste0(Target, " (",SeqId,")"),
+         apt_label = factor(apt_id, levels = complement_soma$apt_id, labels = target_label),
+         section=factor(section, levels = c("Lectin","Classical","C4","C2","C3","Alternative","C5","MAC","Regulatory")),
+         asterisk=if_else(adj.P.Val<0.05,"*",NA))
+logFC_range <- c(min(complement_sum_stats$logFC),max(complement_sum_stats$logFC))
+
+plotComplementHeatmap <- function(sections){
+  filter(complement_sum_stats,section %in% sections) %>%
+    arrange(P.Value) |>
+    distinct(Target, .keep_all = TRUE) |>
+  ggplot(aes(x = "x", y=apt_label)) +
+    geom_tile(aes(fill=logFC)) +
+    geom_text(aes(label = asterisk), size = 5, colour = "black") +
+    scale_fill_gradient2(
+      low = "#00344aff",
+      mid = "#f5f5f5ff",
+      high = "#b53737ff",
+      guide = guide_colorbar(
+        frame.colour = "black",
+        ticks.colour = "black",
+      ), limits = logFC_range
+    ) +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0),limits=rev) +
+    facet_wrap(~section,scales="free_y") +
+    labs(x = NULL, y = NULL, fill = "SomaScan log<sub>2</sub>(FC)") +
+    figTheme("box") +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          strip.clip = "off")
+}
+
+(plotComplementHeatmap(c("Lectin","Classical","Alternative")) /
+plotComplementHeatmap(c("C4","C2"))/
+  plotComplementHeatmap(c("C3"))/
+plotComplementHeatmap(c("C5"))/
+plotComplementHeatmap(c("MAC")) +
+    plot_layout(heights=c(11,3,6,2,7))|
+  plotComplementHeatmap(c("Regulatory"))) +
+  plot_layout(guides="collect",widths=c(4,1)) &
+  theme(legend.position = "top")
+
+```
+
+```{r}
+complement_sum_stats |> glimpse() |>
+  select(apt_id, section,logFC,AveExpr, t,P.Value,adj.P.Val,TargetFullName, Target,EntrezGeneSymbol) |>
+  arrange(P.Value) |> write_csv(here("supp_data/complement_soma_limma.csv"))
+```
+
+
+---
+
+# ELISA QC
+
+Import
+```{r}
+elisa <- readRDS(here("03_complement/data/elisa.tidy.rds"))
+meta <- readRDS(here("03_complement/data/elisa.metadata.rds"))
+```
+
+## Outliers
+
+### PCA
+
+```{r}
+pca_obj <- elisa |>
+  select(target, study_id, log2_concentration) |>
+  pivot_wider(id_cols=study_id, names_from = "target",values_from = "log2_concentration", values_fill = NA) |>
+  column_to_rownames("study_id") |>
+  as.matrix() |>
+  prcomp(center = TRUE, scale. = TRUE)
+```
+
+PCA biplot coloured by GCA diagnosis
+```{r}
+pca_obj$x |>
+  as.data.frame() |>
+  rownames_to_column("study_id") |>
+  left_join(meta,by="study_id") |>
+  ggplot(aes(x=PC1, y=PC2)) +
+geom_point(aes(colour=ref_dx))
+```
+
+Run PCA outlier analysis
+```{r}
+pca_outliers <- outlierPCA(pca_obj,sdLimit = 5)
+```
+
+
+```{r}
+pca_outliers$outliers
+```
+
+Exclude PCA outliers
+```{r}
+elisa <- elisa |> filter(!study_id %in% pca_outliers$outliers)
+meta <- meta |> filter(!study_id %in% pca_outliers$outliers)
+```
+
+
+
+## Target outliers
+
+```{r}
+zscore_qc <- elisa |>
+  mutate(zscore_log2_concentration=scale(log2_concentration, center=TRUE, scale=TRUE), .by=target) |>
+  mutate(rank = dense_rank(zscore_log2_concentration),.by=target) |>
+  # add label so we can remove samples on a per target basis
+  mutate(target_study_id = paste(target, study_id, sep = "_"))
+
+
+zscore_outliers <- zscore_qc |> filter(abs(zscore_log2_concentration)>3) |>
+  select(study_id, target, target_study_id)
+```
+Plot
+```{r fig.height=4, fig.width=6}
+zscore_qc |>
+mutate(Outlier = if_else(target_study_id %in% zscore_outliers$target_study_id, "Yes", "No"),
+       target = factor(target,levels = targets$order, labels=targets$labels)) |>
+  ggplot(aes(x = rank, y=zscore_log2_concentration)) +
+  geom_hline(yintercept=3, linetype="dashed",alpha=0.25) +
+ geom_hline(yintercept=-3, linetype="dashed",alpha=0.25) +
+  geom_point(aes(colour=Outlier)) +
+  scale_colour_manual(values=c("No" = "grey", "Yes" = "red")) +
+  facet_wrap(~target, scale="free") +
+  labs(x = "Ranked samples", y= "Z score") +
+  theme(axis.text.x = element_blank(), axis.ticks.x=element_blank())
+
+ggsave(here("figures/annotated/supp_elisa_outliers.png"), device=agg_png,dpi=600,height=4,width=6)
+```
+How many?
+```{r}
+zscore_outliers |> count(target)
+```
+
+Outlier breakdown per study group
+```{r}
+zscore_outliers |> left_join(select(meta,study_id, ref_dx),by="study_id")
+```
+
+
+Exclude outliers
+```{r}
+elisa <- elisa |>
+  mutate(target_study_id = paste(target, study_id, sep = "_")) |>
+  filter(!target_study_id %in% zscore_outliers$target_study_id)
+
+saveRDS(elisa, here("03_complement/data/elisa.postQC.rds"))
+```
+
+
+
+---
+
+ELISA-SomaScan correlation
+
+Function for plotting
+```{r}
+plotSomaELISA <- function(elisaTarget, aptID){
+elisa_measurement <- elisa |> filter(target==elisaTarget)
+soma_measurement <- tidy_counts |> filter(apt_id==aptID) |> mutate(target = elisaTarget) |>
+  left_join(soma_info |> mutate(target_label = paste0(Target, " (",SeqId,")")) |>
+              select(apt_id, target_label),by="apt_id")
+plot_df <- inner_join(elisa_measurement,soma_measurement,by=c("target", "study_id"))
+spearman_cor <- tidy(cor.test(~log2_concentration + log2_RFU, data=plot_df,method="spearman"))
+plot_df |>
+  ggplot(aes(y = log2_concentration,x=log2_RFU)) +
+  geom_point() +
+  labs(x = paste0(unique(soma_measurement$target_label), "<br>(log<sub>2</sub> RFU)"),
+       y = paste0("ELISA concentration<br>(log<sub>2</sub> ng/mL)"),
+       subtitle = paste0("Spearman's rho = ",round(spearman_cor$estimate,2), "<br>",
+                         formatPvalLabel(spearman_cor$p.value, includeP = TRUE)),
+       title=elisaTarget)
+}
+```
+
+
+C3a, C5a, Factor B, Factor H, CFHR5
+```{r fig.height=8, fig.width=8}
+# C3a
+wrap_plots(plotSomaELISA(elisaTarget = "C3a", aptID = "C3_seq.2755.8"),
+plotSomaELISA(elisaTarget = "C3a", aptID = "C3_seq.4900.8"),
+# C5a
+plotSomaELISA(elisaTarget = "C5a", aptID = "C5_seq.2851.63"),
+# Factor B
+plotSomaELISA(elisaTarget = "fB", aptID = "CFB_seq.4129.72") + ggtitle("Factor B"),
+# Factor H
+plotSomaELISA(elisaTarget = "fH", aptID = "CFH_seq.4159.130") + ggtitle("Factor H"),
+# CFHR5 (3 SOMAmers)
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.3666.17"),
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.16055.3"),
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.7885.17")) +plot_annotation(tag_levels = "a")
+
+ggsave(here("figures/annotated/supp_complement_soma_v_elisa.png"),device=agg_png,dpi=600, height=8, width=8)
+```
+
+TCC components vs sC5b-9
+```{r fig.height=8, fig.width=8}
+wrap_plots(plotSomaELISA(elisaTarget = "sC5b9", aptID = "C6|C5_seq.4482.66") + ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C6_seq.4127.75")+ ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C7_seq.13731.14")+ ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C7_seq.2888.49")+ ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C8G|C8B|C8A_seq.2429.27")+ ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C9_seq.3060.43")+ ggtitle(NULL),
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C9_seq.13722.105")+ ggtitle(NULL)) +
+  plot_annotation(tag_levels = "a")
+
+ggsave(here("figures/annotated/supp_sC5b9_soma_v_elisa.png"),device=agg_png,dpi=600, height=8, width=8)
+```
+
+---
+
+# Linear regression
+
+Testing difference in target log2 concentration between GCA and non-GCA adjusting for age, sex, elisa plate and treatment days
+
+```{r}
+lm_res <- elisa |>
+  mutate(target = factor(target,levels = targets$order, labels=targets$labels)) |>
+  left_join(meta,by="study_id") |>
+  group_by(target) |>
+  do(tidy(lm(log2_concentration ~ ref_dx + poly(age_at_dx,2) + sex + elisa_plate + poly(gc_days,2), data = .))) |>
+  ungroup() |>
+  filter(term=="ref_dxGCA") |>
+  mutate(fdr=p.adjust(p.value,method="fdr"))
+lm_res
+```
+
+Export LM results for supp data
+```{r}
+lm_res |>
+  select(-term) |>
+  write_csv(here("supp_data/elisa_lm.csv"))
+```
+
+
+Concentration boxplots
+
+```{r}
+ conc <-  elisa |>
+  left_join(select(meta,study_id,ref_dx),by="study_id") |>
+  mutate(target = factor(target,levels = targets$order, labels=targets$labels))
+n_samples_per_target <- conc |> count(target,ref_dx)
+
+(figs$boxplots <- map(c("C3a", "C5a", "sC5b-9", "Factor B", "Factor H", "CFHR5"), \(x) conc |>
+    filter(target==x) |>
+  ggplot(aes(x = ref_dx, y=log2_concentration)) +
+  geom_jitter(aes(colour=ref_dx), width = 0.25) +
+  geom_boxplot(outlier.shape = NA, alpha=0.5,width=0.5) +
+  scale_colour_manual(values = col.dx,guide="none") +
+  geom_richtext(data = filter(lm_res,target==x), aes(x = 1.5, y = Inf, label = paste0(
+    "β = ", round(estimate, 2), "<br>",
+    "FDR <i>P</i> = ", map_chr(fdr, \(x) formatPvalLabel(x, includeP = F, digits = 2))
+  )), vjust = 0.75, fill = NA, label.color = NA, size = 3.5) +
+    # sample n
+    geom_text(data=filter(n_samples_per_target,target==x), aes(x = ref_dx, y = -Inf, label = paste0("n = ", n)), vjust=-0.5,size=3) +
+  coord_cartesian(clip="off") +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.25))) +
+  labs(x = NULL, y= "log<sub>2</sub> concentration<br>(ng/mL)",title=x)+
+    theme(plot.title=element_markdown(face="bold"))) |> wrap_plots())
+```
+
+# Main figure panel
+```{r fig.height=10, fig.width=8}
+plot_spacer() /
+  figs$boxplots + plot_layout(heights=c(1.5,1))
+ggsave(here("figures/raw/main_complement.pdf"), height = 10, width = 8)
+```
+
+
+### Source data
+Main
+
+```{r}
+#4a
+filter(complement_sum_stats) %>%
+    arrange(P.Value) |>
+    distinct(Target, .keep_all = TRUE) |> select(apt_id,TargetFullName,Target,EntrezGeneID,logFC,P.Value,adj.P.Val) |>
+    write_csv(here("figures/source_data/4a.csv"))
+#4b
+conc |> filter(target=="C3a") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4b.csv"))
+#4c
+conc |> filter(target=="C5a") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4c.csv"))
+#4d
+conc |> filter(target=="sC5b-9") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4d.csv"))
+# 4e
+conc |> filter(target=="Factor B") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4e.csv"))
+#4f
+conc |> filter(target=="Factor H") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4f.csv"))
+#4g
+conc |> filter(target=="CFHR5") |> select(target,ref_dx,log2_concentration) |>
+  write_csv(here("figures/source_data/4g.csv"))
+```
+
+Supp
+
+```{r}
+#S6a
+plotSomaELISA(elisaTarget = "C3a", aptID = "C3_seq.2755.8")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6a.csv"))
+#S6b
+plotSomaELISA(elisaTarget = "C3a", aptID = "C3_seq.4900.8")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label)|> write_csv(here("figures/source_data/S6b.csv"))
+#S6c
+plotSomaELISA(elisaTarget = "C5a", aptID = "C5_seq.2851.63")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label)|> write_csv(here("figures/source_data/S6c.csv"))
+#S6d
+plotSomaELISA(elisaTarget = "fB", aptID = "CFB_seq.4129.72")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6d.csv"))
+#S6e
+plotSomaELISA(elisaTarget = "fH", aptID = "CFH_seq.4159.130")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6e.csv"))
+#S6f
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.3666.17")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6f.csv"))
+#S6g
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.16055.3")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6g.csv"))
+#S6h
+plotSomaELISA(elisaTarget = "CFHR5", aptID = "CFHR5_seq.7885.17")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S6h.csv"))
+
+
+# S7a
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C6|C5_seq.4482.66")$data |> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7a.csv"))
+# S7b
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C6_seq.4127.75")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7b.csv"))
+# S7c
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C7_seq.13731.14")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7c.csv"))
+# S7d
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C7_seq.2888.49")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7d.csv"))
+# S7e
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C8G|C8B|C8A_seq.2429.27")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7e.csv"))
+# S7f
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C9_seq.3060.43")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7f.csv"))
+# S7g
+plotSomaELISA(elisaTarget = "sC5b9", aptID = "C9_seq.13722.105")$data|> select(target, log2_concentration,apt_id,log2_RFU, target_label) |> write_csv(here("figures/source_data/S7g.csv"))
+```

@@ -1,0 +1,57 @@
+[project]
+name = "GCA_soma"
+r_version = "4.6"
+
+repositories = [
+    { alias = "PPM", url = "https://packagemanager.posit.co/cran/latest"},
+    { alias = "BioCsoft", url = "https://bioconductor.org/packages/3.23/bioc"},
+    { alias = "BioCann", url = "https://bioconductor.org/packages/3.23/data/annotation"},
+    { alias = "BioCexp", url = "https://bioconductor.org/packages/3.23/data/experiment"},
+    { alias = "BioCworkflows", url = "https://bioconductor.org/packages/3.23/workflows"},
+    { alias = "BioCbooks", url = "https://bioconductor.org/packages/3.23/books"}
+]
+
+dependencies = [
+"tidyverse",
+"readxl",
+"janitor",
+"SomaDataIO",
+"arrow",
+"here",
+"variancePartition",
+"here",
+"ggtext",
+"patchwork",
+"ggrepel",
+"data.table",
+"R.utils",
+"ggside",
+"limma",
+"edgeR",
+"msigdbr",
+"fgsea",
+"TissueEnrich",
+"anndataR",
+"rhdf5",
+"SingleCellExperiment",
+"scuttle",
+"sparseMatrixStats",
+"DelayedArray",
+"WGCNA",
+"furrr",
+"nestedcv",
+"ragg",
+"broom",
+"ggstats",
+    "DT",
+    "ggforce",
+    "corrr",
+    "ggdendro",
+    "ggridges",
+    "rms",
+    "tidymodels",
+    "probably",
+    "ggpubr",
+    "ComplexHeatmap",
+    "table1",
+]

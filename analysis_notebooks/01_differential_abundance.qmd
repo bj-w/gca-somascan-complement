@@ -1,0 +1,928 @@
+---
+title: "Differential abundance - GCA vs non-GCA"
+author:
+  - Ben Whittle
+date: now
+date-format: DD-MM-YY HH:mm
+format:
+  html:
+    toc: true
+    toc-depth: 1
+    smooth-scroll: true
+    code-fold: false
+    code-tools: true
+    fig-dpi: 300
+    embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    dev: ragg_png
+execute:
+  warning: false
+---
+
+Setup
+```{r}
+library(here)
+library(ragg)
+library(arrow)
+library(table1)
+library(tidyverse)
+library(ggtext)
+require(ggrepel)
+library(broom)
+library(DT)
+library(patchwork)
+library(corrr)
+
+
+source(here("functions.R"))
+theme_set(figTheme())
+
+figs <- list()
+```
+
+Data import
+```{r}
+meta <- readRDS(here("00_setup/data/metadata.samples.postQC.rds"))
+analytes <- readRDS(here("00_setup/data/metadata.analytes.rds"))
+tidy_counts <- read_parquet(here("00_setup/data/count_tidy.postQC.parquet"))
+
+res.limma <- read_csv(here("01_differential_abundance/data/limma.ref_dx.csv"))
+```
+
+
+---
+
+# Participant info
+
+N participants after QC
+```{r}
+table(meta$ref_dx)
+```
+Duration of GC treatment
+```{r}
+median(meta$gc_days)
+IQR(meta$gc_days)
+```
+
+GC distribution
+```{r}
+wilcox.test(gc_days ~ ref_dx, data = meta)
+```
+
+Age at diagnosis
+```{r}
+wilcox.test(age_at_dx ~ ref_dx, data = meta)
+```
+
+Sex bias
+```{r}
+fisher.test(table(meta$ref_dx, meta$sex))
+```
+
+
+# SOMAmer info
+```{r}
+length(unique(res.limma$EntrezGeneSymbol))
+length(unique(res.limma$Target))
+length(unique(res.limma$UniProt))
+```
+
+Export SOMAmer info, indicating whether it passes QC
+```{r}
+analytes |>
+  select(apt_id, AptName, SeqId, SeqIdVersion, SomaId, TargetFullName, Target, UniProt, EntrezGeneID, ensembl_id,Units,Type,Dilution) |>
+  write_csv(here("supp_data/SOMAmer_info.csv"))
+```
+
+
+---
+
+# Differential abundance
+log2 SOMAmer RFUs compared between GCA and Not GCA adjusted for age, sex,sample log2 RFU IQR and GC days.
+```{r fig.height=4, fig.width=5}
+top_n_daps <- res.limma %>%
+  arrange(P.Value) %>%
+  slice_head(n = 40)
+figs$volcano <- res.limma %>%
+  mutate(
+    colour = case_when(adj.P.Val < 0.05 & logFC > 0 ~ "up",
+      adj.P.Val < 0.05 & logFC < 0 ~ "down",
+      .default = "notSig"
+    ),
+    colour = factor(colour, levels = c("up", "down", "notSig")),
+    label = if_else(apt_id %in% top_n_daps$apt_id, EntrezGeneSymbol, NA)
+  )
+figs$volcano <- figs$volcano %>%
+  ggplot(aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(aes(colour = colour)) +
+  geom_text_repel(aes(label = label), size = 3, min.segment.length = 0, bg.colour = "white", max.overlaps = Inf) +
+  annotate(
+    geom = "text", x = Inf, y = -Inf, label = paste0(nrow(filter(figs$volcano, colour == "up")), " increased in GCA"),
+    hjust = 1, vjust = -1, colour = "#B53737FF", size = 3.5,
+  ) +
+  annotate(
+    geom = "text", x = -Inf, y = -Inf, label = paste0(nrow(filter(figs$volcano, colour == "down")), " decreased in GCA"),
+    hjust = -0.1, vjust = -1, colour = "#00344AFF", size = 3.5
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  scale_x_continuous(limits = c(-2.1, 2.1)) +
+  scale_colour_manual(values = c("up" = "#B53737FF", down = "#00344AFF", notSig = "grey80")) +
+  labs(x = "log<sub>2</sub>(FC)", y = "-log<sub>10</sub>(<i>P</i>)") +
+  theme(legend.position = "none")
+figs$volcano
+```
+
+Differentially abundant SOMAmers
+```{r}
+sig_aptamers <- res.limma %>% filter(adj.P.Val < 0.05)
+nrow(sig_aptamers)
+```
+How many unique proteins?
+```{r}
+length(unique(sig_aptamers$EntrezGeneSymbol))
+length(unique(sig_aptamers$Target))
+length(unique(sig_aptamers$UniProt))
+```
+Export to Supp data
+```{r}
+res.limma |> write_csv(here("supp_data/DAPs.ref_dx.csv"))
+```
+
+
+
+### Acute phase reactants
+```{r}
+res.limma %>% filter(apt_id %in% c("HP_seq.3054.3",
+"HP_seq.7905.30",
+"SAA1_seq.15515.2",
+"SAA2_seq.18832.65",
+"SAA1_seq.4336.2",
+"FGG_seq.4989.7",
+"FGG|FGB|FGA_seq.2796.62",
+"FGB_seq.18890.227",
+"CP_seq.17453.34",
+"CRP_seq.4337.49",
+"LBP_seq.3074.6")) %>% datatable()
+```
+### Immune cell recruitment
+```{r}
+cytokine_apt_ids <- res.limma %>% filter(str_starts(apt_id, "CXCL") | str_starts(apt_id, "CCL") | str_starts(apt_id, "IL") | str_starts(apt_id, "PPBP")) |> pull(apt_id)
+
+res.limma %>% filter(apt_id %in% cytokine_apt_ids) |>  arrange(P.Value) %>% datatable()
+```
+
+### Vasculature remodelling
+```{r}
+res.limma %>% filter(str_starts(apt_id, "MMP") | EntrezGeneSymbol == "TIMP1") %>% datatable()
+```
+
+
+### GWAS overlap
+
+```{r}
+gwas_candidate_genes <- tribble(~gene, ~ensembl_id,
+        "PLG", "ENSG00000122194",
+        "CCDC25", "ENSG00000147419",
+        "CLU","ENSG00000120885",
+        "ELP3","ENSG00000134014",
+        "ESCO2","ENSG00000171320",
+        "LEPROTL1","ENSG00000104660",
+        "PBK","ENSG00000168078",
+        "SCARA3","ENSG00000168077",
+        "SCARA5","ENSG00000168079",
+        "TMEM66","ENSG00000133872",
+        "ACAN","ENSG00000157766",
+        "HAPLN3","ENSG00000140511",
+        "MFGE8","ENSG00000140545",
+        "FOXN1","ENSG00000109101",
+        "IFT20","ENSG00000109083",
+        "LGALS9","ENSG00000168961",
+        "NUFIP2","ENSG00000108256",
+        "POLDIP2","ENSG00000004142",
+        "SARM1","ENSG00000004139",
+        "SEBOX","ENSG00000274529",
+        "SLC13A2","ENSG00000007216",
+        "SLC46A1","ENSG00000076351",
+        "TMEM199","ENSG00000244045",
+        "TMEM97","ENSG00000109084",
+        "TNFAIP1","ENSG00000109079",
+        "VTN", "ENSG00000109072")
+
+res.limma %>% filter(ensembl_id %in% gwas_candidate_genes$ensembl_id) %>%
+  datatable()
+```
+
+
+---
+
+# Tissue + cell enrichment
+Testing tissue, cell-type and protein localisation enrichment among
+differential abundant SOMAmers.
+Used **TissueEnrich** so a lot of references to tissues, but essentially can
+be any group e.g. cell type
+
+Enrichment is based off the following categories:
+- Not expressed: Genes with <1 TPM across all groups
+- Tissue enriched: >1 TPM and >5-fold higher expression in 1 group compared to others
+- Group enriched: >1 TPM and >5-fold higher expression in 2-7 groups compared to others and not tissue enriched
+- Tissue enhanced: >1 TPM and have >5-fold higher expression in 1 group compared to mean expression in other groups and not group enriched
+- Expressed in all: >=1 TPM across any group but not in any of above groups
+- Mixed: not assigned into any of the above groups
+
+```{r}
+tissue_enrich <- readRDS(here("01_differential_abundance/data/tissueEnrichment.rds"))
+cell_enrich <- readRDS(here("01_differential_abundance/data/cellEnrichment.rds"))
+```
+
+### Tissue
+Making use of both HPA + GTEx
+```{r fig.height=6, fig.width=6.5}
+(figs$tissue_enrichment <- tissue_enrich$consensus$source_data %>%
+  mutate(asterisk = if_else(fdr < 0.05, "*", NA)) %>%
+  ggplot(aes(x = fold.change, y = fct_reorder(tissue, fold.change, .desc = TRUE))) +
+  geom_col(aes(fill = -log10(fdr))) +
+  geom_text(aes(label = asterisk), hjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_y_discrete(limits = rev) +
+  labs(x = "Fold change", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)")+
+   theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank()
+  ))
+```
+
+Liver stats
+```{r}
+tissue_enrich$consensus$source_data %>% filter(tissue == "liver")
+```
+
+Export supp data
+```{r}
+tissue_enrich$consensus$source_data |> write_csv(here("supp_data/tissue_specificity.csv"))
+```
+
+
+### Secretome location enrichment
+```{r fig.height=3.5, fig.width=5.5}
+(figs$secretome_enrichment <- tissue_enrich$secretome$ora |>
+  mutate(asterisk = if_else(padj < 0.05, "*", NA)) |>
+  ggplot(aes(x = foldEnrichment, y = fct_reorder(pathway, foldEnrichment, .desc = TRUE))) +
+  geom_col(aes(fill = -log10(padj))) +
+  geom_text(aes(label = asterisk), hjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_y_discrete(limits = rev) +
+  labs(x = "Fold enrichment", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)") +
+   theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank()
+  ))
+```
+Significant stats
+```{r}
+tissue_enrich$secretome$ora |> filter(padj<0.05)
+```
+
+Export supp data
+```{r}
+tissue_enrich$secretome$ora |> write_csv(here("supp_data/secretome.csv"))
+```
+
+
+
+### Immune cell
+```{r fig.height=4, fig.width=7}
+(figs$blood_cell_enrichment <- cell_enrich$blood$source_data %>%
+  mutate(asterisk = if_else(fdr < 0.05, "*", NA)) |>
+  ggplot(aes(x = fold.change, y = fct_reorder(cell_type, fold.change))) +
+  geom_col(aes(fill = -log10(fdr))) +
+  geom_text(aes(label = asterisk), hjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Fold change", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)")+
+   theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank()
+  ))
+```
+
+Export supp data
+```{r}
+cell_enrich$blood$source_data |> write_csv(here("supp_data/immune_cell_specificity.csv"))
+```
+
+
+
+### Vasculature
+Vasculature scRNA-seq from Tabula Sapiens v2
+Enrichment results
+```{r}
+cell_enrich$vasculature$source_data |> datatable()
+```
+
+```{r}
+(figs$vasc_enrichment_with_liver <- cell_enrich$vasculature$source_data %>%
+  mutate(asterisk = if_else(fdr < 0.05, "*", NA)) %>%
+  ggplot(aes(x = fold.change, y = fct_reorder(cell_type, fold.change))) +
+  geom_col(aes(fill = -log10(fdr))) +
+  geom_text(aes(label = asterisk), hjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Fold change", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)") +
+  theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank()
+  ))
+```
+
+Export supp data
+```{r}
+cell_enrich$vasculature$source_data |> write_csv(here("supp_data/vasculature_specificity.csv"))
+```
+
+
+GCA-associated proteins overrepresented in vasculature fibroblast specific genes. Which proteins?
+
+```{r}
+cell_enrich$vasculature$daps <- cell_enrich$vasculature$categories |> filter(Tissue=="fibroblast") |>
+  inner_join(filter(res.limma,adj.P.Val<0.05), by=c("Gene"="ensembl_id")) |>
+  arrange(P.Value)
+cell_enrich$vasculature$daps |> datatable()
+```
+
+Plot expression of vasculature fibroblast specific genes from reference
+```{r}
+vasc_ntpm_scaled <- read_parquet(here("01_differential_abundance/data/vasculature_nTPM.parquet"))
+# rowwise (gene) scaling
+vasc_ntpm_scaled <- vasc_ntpm_scaled |> column_to_rownames("gene_id") |> as.matrix() |> t() |> scale(center=TRUE, scale=TRUE) |> as.data.frame() |> rownames_to_column("cell_type") |>
+  pivot_longer(cols=!cell_type, names_to = "ensembl_id", values_to = "scaled_nTPM")
+```
+
+```{r fig.height=4, fig.width=9}
+(figs$ntpm_vasc <- cell_enrich$vasculature$daps |>
+  left_join(vasc_ntpm_scaled,by=c("Gene"="ensembl_id"),relationship = "many-to-many") |>
+  mutate(Group = replace_values(Group, "Group-Enriched" ~ "Group enriched",
+                                "Tissue-Enhanced" ~ "Fibroblast enhanced",
+                                "Tissue-Enriched" ~ "Fibroblast enriched"),
+         Group=factor(Group, levels=c("Fibroblast enriched","Group enriched","Fibroblast enhanced"))) |>
+  ggplot(aes(y = cell_type, x = EntrezGeneSymbol)) +
+  geom_tile(aes(fill = scaled_nTPM)) +
+  scale_fill_gradient2(
+    low = "#00344aff", mid = "#f5f5f5ff", high = "#b53737ff",
+    guide = guide_colorbar(
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 90)) +
+  scale_y_discrete(expand = c(0, 0), limits = rev) +
+  labs(x = NULL, y = NULL, fill = "Scaled nTPM") +
+  facet_grid(.~Group,scale="free", space="free") +
+  figTheme("box") +
+  theme(axis.text.x = element_text(face = "italic"), strip.clip="off"))
+```
+
+Looks like a lot of acute phase + complement proteins, which we'd expect to be mostly produced by the liver in plasma.
+Are vasculature fibroblast specific genes overrepresented among tissue specific genes?
+
+```{r}
+cell_enrich$fibroblast_tissue_ora |> datatable()
+```
+
+
+```{r fig.height=6}
+(figs$fibroblast_tissue_ora <- cell_enrich$fibroblast_tissue_ora |>
+   filter(overlap>0) |>
+  mutate(asterisk = if_else(padj < 0.05, "*", NA)) |>
+  ggplot(aes(x = foldEnrichment, y = fct_reorder(pathway, foldEnrichment))) +
+  geom_col(aes(fill = -log10(padj))) +
+  geom_text(aes(label = asterisk), hjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Fold enrichment", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)")+
+   theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank()
+  ))
+```
+
+Repeat testing enrichment of GCA associated proteins in vasculature cell types but exclude liver specific genes.
+
+```{r}
+cell_enrich$vasculature_excl_liver$source_data |> datatable()
+```
+
+Export supp data
+```{r}
+cell_enrich$vasculature_excl_liver$source_data |> write_csv(here("supp_data/vasculature_specificity_excl_liver.csv"))
+```
+
+
+```{r fig.height=4, fig.width=5}
+(figs$vasc_enrichment_excl_liver <- cell_enrich$vasculature_excl_liver$source_data %>%
+  mutate(asterisk = if_else(fdr < 0.05, "*", NA)) %>%
+  ggplot(aes(x = fold.change, y = fct_reorder(cell_type, fold.change))) +
+  geom_col(aes(fill = -log10(fdr))) +
+  geom_richtext(data = cell_enrich$vasculature_excl_liver$source_data %>% filter(fdr < 0.05), aes(label = paste0("FDR ", formatPvalLabel(fdr))), hjust = 1, size = 3, fill = NA, label.color = NA) +
+  scale_fill_viridis_c(guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Fold change", y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)", title = "Tabula Sapiens v2: Vasculature<br>(Excluding liver-specific genes)") +
+  theme(
+    legend.position = "inside",
+    legend.justification.inside = c(1, 0),
+    legend.background = element_blank(),
+    legend.title.position = "top", legend.title = element_markdown(hjust=0.5)
+  ))
+```
+
+
+Vasculature fibroblast stats
+```{r}
+cell_enrich$vasculature$source_data %>% filter(cell_type == "fibroblast")
+```
+
+Plot GCA associated proteins enriched in vasculature fibroblasts
+```{r fig.height=4.5, fig.width=3.5}
+cell_enrich$vasculature_excl_liver$daps <- cell_enrich$vasculature_excl_liver$categories |> filter(Tissue=="fibroblast") |>
+  inner_join(filter(res.limma,adj.P.Val<0.05), by=c("Gene"="ensembl_id")) |>
+  arrange(P.Value) |>
+  distinct(EntrezGeneSymbol, .keep_all = TRUE)
+cell_enrich$vasculature_excl_liver$daps |> datatable()
+(figs$vasc_enriched_daps <- cell_enrich$vasculature_excl_liver$daps |>
+  mutate(Group = replace_values(Group, "Group-Enriched" ~ "Group\nenriched",
+                                "Tissue-Enhanced" ~ "Fibroblast\nenhanced",
+                                "Tissue-Enriched" ~ "Fibroblast\nenriched"),
+         Group=factor(Group, levels=c("Fibroblast\nenriched","Group\nenriched","Fibroblast\nenhanced"))) |>
+  ggplot(aes(y = fct_reorder(EntrezGeneSymbol, logFC), x = Tissue)) +
+  geom_tile(aes(fill = logFC)) +
+  # geom_text(aes(label = asterisk), colour = "white", fontface = "bold", size = 5) +
+  labs(x = NULL, y = NULL, fill = "log<sub>2</sub>(FC)") +
+  scale_y_discrete(expand = c(0, 0), position="right") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_fill_gradient2(low = "#00344aff", mid = "#f5f5f5ff", high = "#b53737ff", guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  #ggforce::facet_col(~ Group, scale = "free_x", strip.position = "bottom") +
+  facet_grid(Group~., scale="free",space="free", switch="y") +
+  figTheme("box") +
+  theme(
+    strip.clip = "off", strip.text.y.left = element_text(angle = 0),
+    legend.position = "bottom", legend.title.position = "top", legend.title = element_markdown(hjust=0.5), axis.ticks.x = element_blank(), axis.text.x = element_blank()))
+```
+
+
+
+Heatmap of nTPMs for the above fibroblast specific genes
+```{r fig.height=4, fig.width=9}
+(figs$ntpm_vasc_excl_liver <- cell_enrich$vasculature_excl_liver$daps |>
+  left_join(vasc_ntpm_scaled,by=c("Gene"="ensembl_id"),relationship = "many-to-many") |>
+  mutate(Group = replace_values(Group, "Group-Enriched" ~ "Group enriched",
+                                "Tissue-Enhanced" ~ "Fibroblast enhanced",
+                                "Tissue-Enriched" ~ "Fibroblast enriched"),
+         Group=factor(Group, levels=c("Fibroblast enriched","Group enriched","Fibroblast enhanced"))) |>
+    ggplot(aes(y = cell_type, x = EntrezGeneSymbol)) +
+  geom_tile(aes(fill = scaled_nTPM)) +
+  scale_fill_gradient2(
+    low = "#00344aff", mid = "#f5f5f5ff", high = "#b53737ff",
+    guide = guide_colorbar(
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 90)) +
+  scale_y_discrete(expand = c(0, 0), limits = rev) +
+  labs(x = NULL, y = NULL, fill = "Scaled nTPM") +
+  facet_grid(.~Group,scale="free", space="free") +
+  figTheme("box") +
+  theme(axis.text.x = element_text(face = "italic"), strip.clip="off"))
+```
+
+### Supp figure panel
+```{r fig.height=14, fig.width=14}
+(((wrap_elements(full=figs$tissue_enrichment+theme(axis.text.y=element_text(size=8))) /
+  wrap_elements(full=figs$fibroblast_tissue_ora) + plot_layout(heights = c(2,1))) |
+((figs$secretome_enrichment| figs$vasc_enrichment_with_liver) / figs$ntpm_vasc)) + plot_layout(widths=c(1,3))) /
+  (figs$ntpm_vasc_excl_liver | wrap_elements(full=figs$blood_cell_enrichment)) +plot_layout(heights=c(2.75,1))
+
+ggsave(here("figures/raw/supp_tissue_cell_enrichment.pdf"),
+  height = 14, width = 14
+)
+```
+
+
+---
+
+# GSEA
+GSEA performed on ranked t-statistics from differential abundance analysis.
+```{r}
+# import
+gsea_tidy <- map(c("hallmark", "reactome"), \(x) readRDS(here("01_differential_abundance/data/gsea.rds")) |>
+                                              pluck(x, "gseaOutput")) |>
+
+  set_names(c("hallmark", "reactome")) |> list_rbind(names_to = "source") |>
+  mutate(nes_direction = if_else(NES > 0, "Gene set increased in GCA", "Gene set decreased in GCA"))
+```
+
+
+
+```{r fig.height=5, fig.width=5}
+figs$gsea_heatmap <- gsea_tidy %>% filter(padj < 0.05)
+
+# get order of pathways for plotting
+geneset_order <- figs$gsea_heatmap %>%
+  arrange(desc(NES)) |>
+  arrange(source) |>
+  pull(pathway)
+
+(figs$gsea_heatmap <- map(c("Gene set increased in GCA", "Gene set decreased in GCA"), \(x) figs$gsea_heatmap %>%
+  filter(nes_direction == x) %>%
+  ggplot(aes(x = "x", y = factor(pathway, levels = geneset_order))) +
+  geom_tile(aes(fill = NES)) +
+  scale_fill_gradient2(
+    low = "#90005D", mid = "#F4FAF0", high = "#315D00",
+    limits = c(min(figs$gsea_heatmap$NES), max(figs$gsea_heatmap$NES)),
+    guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")
+  ) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0), limits = rev, labels = scales::wrap_format(40)) +
+  labs(x = NULL, y = NULL) +
+  figTheme("box") +
+    facet_grid(source~., scale="free_y", space="free") +
+  theme(
+    strip.text.y.left = element_text(angle = 0),
+    strip.placement = "outside",
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )))
+```
+
+
+```{r fig.height=8, fig.width=12}
+gsea_somamers <- readRDS(here("01_differential_abundance/data/somamers_used_gsea.rds"))
+gseaHeatmaps <- function() {
+  df <- gsea_tidy |>
+    filter(padj < 0.05) |>
+    unnest(leadingEdge) |>
+    select(source, pathway, EntrezGeneID = leadingEdge, NES) |>
+    left_join(res.limma, by = "EntrezGeneID", relationship = "many-to-many") |>
+    filter(
+      apt_id %in% gsea_somamers$apt_id,
+      adj.P.Val < 0.05
+    ) |>
+    mutate(direction = case_when(
+      NES > 0 ~ "Proteins increased in GCA",
+      NES < 0 ~ "Proteins reduced in GCA"
+    ))
+
+  dirs <- unique(df$direction)
+
+  imap(c("Proteins increased in GCA", "Proteins reduced in GCA"), \(x, i) {
+    direction_df <- df |> filter(direction == x)
+
+    protein_in_gs <- map(unique(direction_df$pathway), \(pw) {
+      direction_df |>
+        distinct(EntrezGeneSymbol) |>
+        mutate(
+          in_gs = if_else(
+            EntrezGeneSymbol %in% filter(direction_df, pathway == pw)$EntrezGeneSymbol,
+            "Yes", "No"
+          ),
+          pathway = pw
+        )
+    }) |> list_rbind()
+
+
+    protein_order <- protein_in_gs |>
+      count(in_gs, EntrezGeneSymbol) |>
+      filter(in_gs == "Yes") |>
+      arrange(desc(n)) |>
+      pull(EntrezGeneSymbol) |>
+      unique()
+
+
+
+    p_logfc <- direction_df |>
+      distinct(apt_id, .keep_all = TRUE) |>
+      mutate(EntrezGeneSymbol = factor(EntrezGeneSymbol, levels = protein_order)) |>
+      ggplot(aes(x = EntrezGeneSymbol, y = "GCA diagnosis<br>log<sub>2</sub>(FC)")) +
+      geom_tile(aes(fill = logFC), colour = "black", linewidth = 0.5) +
+      scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 45), position = "top") +
+      scale_y_discrete(expand = c(0, 0), position = "right") +
+      scale_fill_gradient2(low = "#00344aff", mid = "#f5f5f5ff", high = "#b53737ff",
+                           limits = c(min(df$logFC), max(df$logFC)),
+                           guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+      labs(x = NULL, y = NULL, fill = "log<sub>2</sub>(FC)") +
+      figTheme("box") +
+      theme(axis.text.y.right = ggtext::element_markdown(size=10))
+
+
+    p_gsea <- direction_df |>
+      select(pathway, NES, source) |>
+      distinct() |>
+      mutate(pathway = factor(pathway, levels = geneset_order)) |>
+      ggplot(aes(x = "x", y = pathway)) +
+      geom_tile(aes(fill = NES), colour = "black", linewidth = 0.5) +
+      scale_x_discrete(expand = c(0, 0)) +
+      scale_y_discrete(expand = c(0, 0), limits = rev, labels = scales::wrap_format(50)) +
+      scale_fill_gradient2(low = "#90005D", mid = "#F4FAF0", high = "#315D00",
+                           limits = c(min(df$NES), max(df$NES)),
+                           guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+      labs(x = NULL, y = NULL) +
+      facet_grid(factor(source,
+                        levels = c("hallmark", "reactome"),
+                        labels = c("hallmark"="Hallmark", "reactome"="Reactome"))~.,
+                 scale="free_y", space="free",switch = "y") +
+      figTheme("box") +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),axis.text.y=element_text(size=8),
+            strip.placement = "outside",strip.clip = "off")
+
+
+    p_in_gs <- protein_in_gs |>
+      mutate(
+        pathway = factor(pathway, levels = geneset_order),
+        EntrezGeneSymbol = factor(EntrezGeneSymbol, levels = protein_order)
+      ) |>
+      ggplot(aes(x = EntrezGeneSymbol, y = pathway)) +
+      geom_tile(aes(fill = in_gs), colour = "black", linewidth = 0.5) +
+      scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 45), position = "top") +
+      scale_y_discrete(expand = c(0, 0), limits = rev) +
+      scale_fill_manual(values = c("Yes" = "grey25", "No" = "white"), na.value = NA) +
+      labs(x = NULL, y = NULL, fill = "Protein in gene set") +
+      figTheme("box") +
+      theme(axis.text = element_blank(), axis.ticks = element_blank())
+
+    top_panel_height <- c(1, 10)
+
+    p <- ((plot_spacer() / p_gsea + plot_layout(heights = top_panel_height)) |
+            (p_logfc / p_in_gs + plot_layout(heights = top_panel_height))) +
+      plot_layout(widths = c(1, 15), heights = c(1, 10), guides = "collect") +
+      plot_annotation(subtitle = x)
+
+    # remove legends from first group only
+    if (i == 1) p <- p & theme(legend.position = "none")
+    if (i != 1) p <- p & theme(legend.position = "bottom")
+
+    p
+  })
+}
+(figs$gsea_heatmaps <- wrap_plots(gseaHeatmaps(), ncol=1))
+```
+
+Export supp data
+```{r}
+gsea_tidy |> write_csv(here("supp_data/gsea.csv"))
+```
+
+
+---
+
+# Comparison with published Olink results
+Using TAB+ cGCA vs Not cGCA from Rob's paper.
+Olink analysis uses as superset of the SomaScan samples.
+
+First check sample overlap
+```{r}
+olink_sample_ids <- read_csv(here("raw_data/TABUL_Olink/Cohort2_Post_QC_Batch-AdjustedZ-scores.csv")) |>
+  #drop first column (row numbers)
+  select(-1) |>
+  select(study_id=S_ID)
+
+table(meta$study_id %in% olink_sample_ids$study_id)
+```
+
+
+```{r}
+# olink sum stats
+olink_gca <- readxl::read_xlsx(here("raw_data/lvv_olink/MaughanEtAl2025_supp.xlsx"), sheet = 14, skip = 2) %>%
+  janitor::clean_names()
+```
+
+
+### Overlap of protein between Olink and SomaScan panels
+
+Rerun SomaScan GCA associations - followed method in Rob's paper. lm(protein ~ ref_dx)
+```{r}
+soma_olink <- readRDS(here("01_differential_abundance/data/lvv_olink_soma_replication_lm.rds")) |>
+  left_join(olink_gca,by="ensembl_id", suffix = c(".soma", ".olink")) |>
+  mutate(adj_pval.olink=p.adjust(pval.olink,method="fdr"),
+         platform_sig = case_when(adj_pval.soma < 0.05 & adj_pval.olink<0.05 ~ "Both",
+                                  adj_pval.soma < 0.05 & adj_pval.olink > 0.05 ~ "SomaScan",
+                                  adj_pval.soma > 0.05 & adj_pval.olink <0.05 ~ "Olink",
+                                  adj_pval.soma > 0.05 & adj_pval.olink > 0.05 ~ "None"))
+```
+
+How many SOMAmers target the overlapping proteins?
+```{r}
+length(unique(soma_olink$apt_id))
+```
+
+## Effect size correlation
+```{r}
+(figs$olink_comparison <- ggplot(soma_olink, aes(x = log2fc.soma, y = log2fc.olink)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.25) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.25) +
+  geom_point(aes(colour = platform_sig)) +
+  geom_richtext(
+    data = tidy(cor.test(~ log2fc.soma + log2fc.olink, data = soma_olink, method = "pearson")),
+    aes(x = -Inf, y = Inf, label = paste0(
+      "<i>r</i> = ", round(estimate, 2), "<br>",
+      formatPvalLabel(p.value), "<br>",
+      "Common proteins = ", length(unique(soma_olink$UniProt))
+    )),
+    size = 3.5, fill = NA, label.color = NA, vjust = 1, hjust = 0
+  ) +
+  geom_text_repel(data = soma_olink %>% filter(platform_sig == "Both"), aes(label = EntrezGeneSymbol), max.overlaps = Inf, min.segment.length = 0, bg.colour = "white", size = 3) +
+  scale_colour_manual(values = c(
+    "Both" = "#009E73", "SomaScan" = "#E69F00",
+    "Olink" = "#56B4E9", "None" = "grey"
+  )) +
+  labs(
+    x = "log<sub>2</sub>(FC) SomaScan", y = "log<sub>2</sub>(FC) Olink",
+    colour = "FDR <i>P</i> < 0.05"
+  ) +
+  theme(legend.position = "bottom", legend.title.position = "top", legend.title = element_markdown(hjust=0.5)))
+
+```
+
+Restrict to proteins sig associated (FDR < 0.05) in both platform comparisons
+```{r}
+soma_olink_sig_both <- soma_olink |> filter(platform_sig=="Both")
+datatable(soma_olink_sig_both)
+
+# N somamer
+nrow(soma_olink_sig_both)
+
+# n proteins (uniprot)
+length(unique(soma_olink_sig_both$UniProt))
+```
+Proteins up + down
+```{r}
+#up
+unique(filter(soma_olink_sig_both,log2fc.soma>0)$EntrezGeneSymbol)
+#down
+unique(filter(soma_olink_sig_both,log2fc.soma<0)$EntrezGeneSymbol)
+```
+
+Plot
+```{r fig.height=4, fig.width=5}
+(figs$olink_comparison_sig_both <- ggplot(soma_olink_sig_both,aes(x=log2fc.soma, y=log2fc.olink)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.25) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.25) +
+  geom_point(colour = "#009E73") +
+  geom_richtext(
+    data = tidy(cor.test(~ log2fc.soma + log2fc.olink, data = soma_olink_sig_both, method = "pearson")),
+    aes(x = -Inf, y = Inf, label = paste0(
+      "<i>r</i> = ", round(estimate, 2), "<br>",
+      formatPvalLabel(p.value), "<br>")),
+    size = 3.5, fill = NA, label.color = NA, vjust = 1, hjust = 0
+  ) +
+  geom_text_repel(aes(label = EntrezGeneSymbol), max.overlaps = Inf, min.segment.length = 0, bg.colour = "white", size = 3) +
+  labs(x = "log<sub>2</sub>(FC) SomaScan", y = "log<sub>2</sub>(FC) Olink"))
+ggsave(here("figures/annotated/supp_soma_olink_sig.png"), height = 4, width = 5, dpi=600, device=agg_png)
+```
+
+Export supp data
+```{r}
+soma_olink |> select(apt_id, olink_target = protein, ensembl_id, log2fc.soma, std_error.soma,
+                     pval.soma, adj_pval.soma, log2fc.olink, pval.olink, adj_pval.olink, platform_sig) |>
+  write_csv(here("supp_data/soma_olink_comparison.csv"))
+```
+
+
+---
+
+# GCA only comparisons
+Import limma results
+```{r}
+gca_only <- list()
+gca_only$limma <- readRDS(here("01_differential_abundance/data/gca_only_limma_output.rds"))
+names(gca_only$limma)
+```
+
+Import group samples sizes
+```{r}
+gca_only$sample_groups <- readRDS(here("01_differential_abundance/data/gca_only_meta.rds"))
+```
+
+
+GCA symptoms
+```{r fig.height=4, fig.width=8}
+figs$gca_only_volcanoes <- wrap_plots(
+  # cranial ischaemia complications
+  plotVolcano(resultsDf = gca_only$limma$cranial_isch, title = "Cranial ischaemia") +
+    labs(subtitle = paste0("Present (n = ", gca_only$sample_groups %>%
+                             count(cranial_isch_comp_rm) %>%
+                             filter(cranial_isch_comp_rm == "Yes") %>%
+                             pull(n), ") vs absent (n = ", gca_only$sample_groups %>% count(cranial_isch_comp_rm) %>%
+                             filter(cranial_isch_comp_rm == "No") %>%
+                             pull(n), ")")),
+  # PMR
+  plotVolcano(resultsDf = gca_only$limma$pmr, title = "PMR") +
+    labs(subtitle = paste0("Symptoms present (n = ",gca_only$sample_groups %>%
+                             count(pmryesno) %>%
+                             filter(pmryesno=="yes") %>%
+                             pull(n), ") vs absent (n = ",gca_only$sample_groups %>%
+                             count(pmryesno) %>%
+                             filter(pmryesno=="no") %>%
+                             pull(n), ")")),
+  ncol = 2
+) & theme(plot.subtitle = ggtext::element_markdown(hjust = 0.5))
+
+figs$gca_only_volcanoes + plot_annotation(tag_levels = "a")
+
+ggsave(here("figures/annotated/supp_gca_only.png"), height = 4, width = 8)
+```
+Export supp data
+```{r}
+gca_only$limma$cranial_isch |> write_csv(here("supp_data/limma.gca_only.cranial_isch.csv"))
+gca_only$limma$pmr |> write_csv(here("supp_data/limma.gca_only.pmr.csv"))
+```
+
+
+---
+
+# Figure panel
+
+### Main
+```{r fig.height=12, fig.width=15}
+p1 <- ((wrap_elements(full=figs$volcano) +
+         figs$vasc_enrichment_excl_liver+theme(legend.position = "bottom") +
+         figs$vasc_enriched_daps +
+         figs$olink_comparison)) + plot_layout(widths = c(4.5,1,0.15, 4))
+
+
+p2 <- (figs$gsea_heatmaps)
+cowplot::plot_grid(p1, p2, ncol = 1, rel_heights = c(1,1))
+ggsave(here("figures/raw/main_differential_abundance.pdf"), height = 12, width = 15)
+```
+
+### Source data
+Main
+```{r}
+# 2a
+figs$volcano$data |> select(apt_id, logFC,P.Value,adj.P.Val,EntrezGeneSymbol) |> write_csv(here("figures/source_data/2a.csv"))
+#2b,c
+gsea_tidy |>
+  filter(padj < 0.05) |>
+  unnest(leadingEdge) |>
+  select(source, pathway, EntrezGeneID = leadingEdge, NES) |>
+  left_join(res.limma, by = "EntrezGeneID", relationship = "many-to-many") |>
+  filter(
+    apt_id %in% gsea_somamers$apt_id,
+    adj.P.Val < 0.05
+  ) |>
+  mutate(direction = case_when(
+    NES > 0 ~ "Proteins increased in GCA",
+    NES < 0 ~ "Proteins reduced in GCA"
+  )) |>
+  select(source,pathway,EntrezGeneID,NES,apt_id,logFC,P.Value,adj.P.Val,EntrezGeneSymbol,direction) |>
+  write_csv(here("figures/source_data/2b_c.csv"))
+
+#2d
+figs$vasc_enrichment_excl_liver$data |> write_csv(here("figures/source_data/2d.csv"))
+
+#2e
+figs$vasc_enriched_daps$data |> select(Gene,Tissue,Group,apt_id,logFC,P.Value,adj.P.Val,EntrezGeneSymbol) |>
+  write_csv(here("figures/source_data/2e.csv"))
+
+#2f
+figs$olink_comparison$data |>select(apt_id,olink_target = protein,ensembl_id,log2fc.soma,pval.soma,adj_pval.soma,
+                                              log2fc.olink,pval.olink,adj_pval.olink,platform_sig) |> write_csv(here("figures/source_data/2f.csv"))
+```
+
+Supp
+```{r}
+#S2a
+figs$tissue_enrichment$data |> write_csv(here("figures/source_data/S2a.csv"))
+#S2b
+figs$secretome_enrichment$data|> write_csv(here("figures/source_data/S2b.csv"))
+#S2c
+figs$vasc_enrichment_with_liver$data |> write_csv(here("figures/source_data/S2c.csv"))
+#S2d
+figs$fibroblast_tissue_ora$data |> write_csv(here("figures/source_data/S2d.csv"))
+#S2e
+figs$ntpm_vasc$data |> select(EntrezGeneSymbol, Gene,cell_type,Group,scaled_nTPM) |> write_csv(here("figures/source_data/S2e.csv"))
+#S2f
+figs$ntpm_vasc_excl_liver$data |> select(EntrezGeneSymbol, Gene,cell_type,Group,scaled_nTPM) |> write_csv(here("figures/source_data/S2f.csv"))
+#S2g
+figs$blood_cell_enrichment$data |> write_csv(here("figures/source_data/S2g.csv"))
+
+#S3
+figs$olink_comparison_sig_both$data |> select(apt_id,olink_target = protein,ensembl_id,log2fc.soma,pval.soma,adj_pval.soma,
+                                              log2fc.olink,pval.olink,adj_pval.olink,platform_sig) |>
+  write_csv(here("figures/source_data/S3.csv"))
+
+# S4
+bind_rows(gca_only$limma$cranial_isch |> mutate(trait = "Cranial ischaemia"),
+gca_only$limma$pmr |> mutate(trait="PMR")) |>
+   select(trait, apt_id, logFC,P.Value,adj.P.Val,EntrezGeneSymbol) |>
+  write_csv(here("figures/source_data/S4.csv"))
+```

@@ -1,0 +1,723 @@
+---
+title: "Protein coabundance networks"
+author:
+  - Ben Whittle
+date: now
+date-format: DD-MM-YY HH:mm
+format:
+  html:
+    toc: true
+    toc-depth: 1
+    code-fold: false
+    fig-dpi: 300
+    smooth-scroll: true
+    embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    dev: ragg_png
+---
+
+Set up
+```{r}
+#| message: false
+library(here)
+library(arrow)
+library(ragg)
+library(WGCNA)
+library(tidyverse)
+library(ggtext)
+library(ggforce)
+library(ggrepel)
+library(broom)
+library(patchwork)
+library(ggdendro)
+library(ggstats)
+
+source(here("functions.R"))
+theme_set(figTheme())
+figs <- list()
+```
+
+Generic plotting functions
+```{r}
+# plot function
+plotModuleTraitAssociation <- function(lmOutput, module, trait, plotType, plotTitle=NULL, moduleColour = NULL) {
+  # whether to colour by module colour or a prespecified colour
+  if (is.null(moduleColour)) {
+    fillColour <- module_colours[[module]]
+  } else {
+    fillColour <- moduleColour
+  }
+  # create df with desired module and trait
+  trait_df <- lmOutput %>%
+    filter(module == {{ module }}) %>%
+    left_join(meta[, c("study_id", trait)], by = "study_id")
+  # plot
+  p <- trait_df %>% ggplot(aes(x = !!sym(trait), y = eigengene)) +
+    labs(y = "Eigenprotein", title = plotTitle)
+  if (plotType == "category") {
+    # report linear model output
+    stats <- lm(reformulate(termlabels = trait, response = "eigengene"), data = trait_df)
+    p <- p +
+      geom_jitter(aes(colour=!!sym(trait)), width=0.25) +
+      geom_boxplot(outlier.shape = NA, alpha=0.5,width=0.5) +
+      geom_richtext(data = tidy(stats) %>% filter(!term == "(Intercept)"), aes(x = 1.5, y = Inf, label = paste0(
+        "β = ", round(estimate, 2), "<br>",
+        formatPvalLabel(p.value, includeP = T)
+      )), vjust = 0.75, fill = NA, label.color = NA, size = 3) +
+      coord_cartesian(clip="off") +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.25)))
+  }  else if (plotType == "numeric") {
+    # report Pearson's r
+    stats <- tidy(cor.test(reformulate(c("eigengene", trait)), data = trait_df))
+    cor_sign <- if_else(stats$estimate>0,"pos","neg")
+    p <- p +
+      geom_point(colour = fillColour) +
+      geom_smooth(method = "lm", colour = "grey30") +
+      geom_richtext(data = stats, aes(x = Inf, y = if_else(cor_sign=="pos", -Inf, Inf), label = paste0(
+        "<i>r</i> = ", round(estimate, 2), "<br>",
+        formatPvalLabel(p.value, includeP = T)
+      )), vjust = if_else(cor_sign=="pos", 0, 1), hjust = 1, fill = NA, label.color = NA, size = 3)
+  } else {
+    message("plotType should be category / numeric.")
+  }
+  output <- list(stats = stats, plot = p)
+  return(output)
+}
+
+
+plotModuleConnectivityTrait <- function(traitResults, statColumn, connectivityDf, module, wgcnaObjectColors,
+                                         plotTitle = NULL, moduleColour = NULL) {
+  # whether to colour by module colour or a prespecified colour
+  if (is.null(moduleColour)) {
+    fillColour <- module_colours[[module]]
+  } else {
+    fillColour <- moduleColour
+  }
+  yLabel <- paste0(module, " connectivity")
+  # for dplyr filtering
+  module <- enquo(module)
+  # column to use in place of "t" (as a symbol, for tidy evaluation)
+  statColumn <- rlang::sym(statColumn)
+  # just keep module members
+  membership_df <- data.frame(apt_id = names(wgcnaObjectColors), module = paste0("ME", wgcnaObjectColors)) %>%
+    filter(module == {{ module }})
+  # merge into one df
+  df <- connectivityDf %>%
+    filter(module == {{ module }}) %>%
+    filter(apt_id %in% membership_df$apt_id) %>%
+    left_join(traitResults, by = "apt_id")
+
+
+  stats <- tidy(cor.test(df$pearson, df %>% pull(!!statColumn)))
+  cor_sign <- if_else(stats$estimate > 0, "pos", "neg")
+  p <- ggplot(df, aes(x = !!statColumn, y = pearson)) +
+    geom_point(colour=fillColour) +
+    geom_richtext(data = stats,
+                aes(x = Inf, y = if_else(cor_sign == "pos", -Inf, Inf), label = paste0(
+                  "<i>r</i> = ", round(estimate,2), "<br>",
+                  formatPvalLabel(p.value))),
+vjust = if_else(cor_sign=="pos", 0, 1), hjust = 1, size = 3, fill = NA, label.color = NA) +
+    geom_smooth(method="lm", colour="grey30") +
+    labs(y = yLabel, fill = NULL, title = plotTitle) +
+    theme(legend.position = "bottom", legend.text = element_markdown())
+  return(list(df = df, plot = p))
+}
+
+plotModuleORA <- function(oraDF, module, showTopN = NULL, title = NULL, yLabSize = 10, yLabWrap = 30) {
+  df <- oraDF %>%
+    filter(module == {{ module }}) %>%
+    filter(fdr < 0.05) %>%
+    arrange(p.value)
+  if (!is.null(showTopN)) {
+    df <- df %>% slice_head(n = showTopN)
+  }
+  ggplot(df, aes(x = -log10(fdr), y = fct_reorder(geneset, fdr, .desc = TRUE))) +
+    geom_col(fill = "grey75", colour = "black") +
+    scale_y_discrete(labels = scales::label_wrap(yLabWrap)) +
+    scale_x_continuous(expand = c(0, 0)) +
+    labs(title = title) +
+    labs(x = "-log<sub>10</sub>(FDR <i>P</i>)", y = NULL) +
+    theme(axis.text.y = element_text(size = yLabSize))
+}
+```
+
+
+Data import
+```{r}
+meta <- readRDS(here("00_setup/data/metadata.samples.postQC.rds"))
+meta <- meta %>% mutate(ref_dx=fct_recode(ref_dx, "non-GCA"="not_cGCA", "GCA"="cGCA"))
+counts <- read_parquet(here("00_setup/data/count_tidy.postQC.parquet"))
+protein_info <- readRDS(here("00_setup/data/metadata.analytes.rds"))
+
+
+de <- list(ref_dx = read_csv(here("01_differential_abundance/data/limma.ref_dx.csv")),
+           baseline_crp = readRDS(here("01_differential_abundance/data/soma_baseline_crp_spearman.rds")),
+           baseline_esr = readRDS(here("01_differential_abundance/data/soma_baseline_esr_spearman.rds")),
+           platelets = readRDS(here("01_differential_abundance/data/soma_platelets_spearman.rds")))
+
+```
+
+---
+
+# Set up coabundance network
+Import WGCNA object
+```{r}
+net <- readRDS(here("02_protein_modules/data/network.rds"))
+# assign colours
+aptamer_colours <- labels2colors(net$colors)
+
+# import module connectivity
+# Here connectivity essentially refers to the relationship between the protein
+# abundance (residualised against covariates) and the module eigenprotein.
+module_connectivity <- read_parquet(here("02_protein_modules/data/connectivity.parquet"))
+
+# Assigning biological definitions to modules
+# Used one-sided Fisher's test to assess enrichment of module members with gene sets.
+geneset_ora <- readRDS(here("02_protein_modules/data/geneset_ora.wgcna_modules.rds"))
+```
+
+
+Soft thresholding power plots
+```{r fig.height=6.5, fig.width=6}
+sft <- readRDS(here("02_protein_modules/data/soft_thresholding.rds"))
+# power used
+sft$power
+# plots
+figs$signed_r2 <- sft$sft %>%
+  ggplot(aes(x = Power, y = model_fit)) +
+  geom_point() +
+  geom_text(aes(label = Power), vjust = -0.5, size = 2.75) +
+  geom_hline(yintercept = 0.85, colour = "red", linetype = "dashed") +
+  labs(x = "Soft threshold (power)", y = "Signed R<sup>2</sup>") +
+  coord_cartesian(clip="off")
+figs$mean_connectivity <- sft$sft %>%
+  ggplot(aes(x = Power, y = mean.k.)) +
+  geom_point() +
+  geom_text(aes(label = Power), vjust = -0.5, size = 2.75) +
+  labs(x = "Soft threshold (power)", y = "Mean connectivity") +
+  coord_cartesian(clip="off")
+figs$signed_r2 / figs$mean_connectivity
+```
+A power of `{r} sft$power` was used.
+
+### Module info
+How many aptamers in each module?
+```{r}
+table(aptamer_colours)
+```
+Extract module members
+```{r}
+module_members <- data.frame(module=net$colors) %>%
+  mutate(module=paste0("ME",module)) %>%
+  rownames_to_column("apt_id")
+```
+
+
+We can also compare modules based on their eigenproteins.
+First calculate a dissimilarity measure between the module eigenproteins (preserving the sign of the correlation).
+Remove module 0 as this contains SOMAmers that were not assigned a module.
+```{r}
+module_dend <- dendro_data(as.dendrogram(hclust(as.dist((1 - t(cor(net$MEs[, !(colnames(net$MEs) == "ME0")], method = "p"))) / 2), method = "average")))
+```
+Before plotting we can extract the module colours which will be the basis for future plots.
+```{r}
+module_colours <- aptamer_colours
+names(module_colours) <- paste0("ME", net$colors)
+module_colours <- module_colours[unique(names(module_colours))]
+# remove module 0
+module_colours <- module_colours[!names(module_colours) == "ME0"]
+
+# replace light cyan as you can't see it
+#module_colours[module_colours == "lightcyan"] <- "darkcyan"
+module_colours[module_colours == "white"] <- "ivory3"
+module_colours[module_colours == "lightyellow"] <- "gold"
+# set module order
+module_order <- module_dend$labels$label
+```
+
+
+```{r fig.height=0.3, fig.width=6}
+figs$module_colours <- data.frame(module_colours) %>%
+  rownames_to_column("module") %>%
+  ggplot(aes(x = fct_relevel(module, module_order), y = "blank")) +
+  geom_tile(aes(fill = module)) +
+  scale_fill_manual(values = module_colours) +
+  scale_y_discrete(expand = c(0.01, 0.1)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  figTheme("box") +
+  labs(x = NULL, y = NULL) +
+  theme(legend.position = "none", axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+```
+
+Hierarchical module clustering
+```{r fig.height=2, fig.width=3}
+figs$module_dendrogram <- ggplot(module_dend$segments) +
+  geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) +
+  scale_x_continuous(
+    expand = c(0.01, 0.1), breaks = label(module_dend)$x,
+    labels = label(module_dend)$label, guide = guide_axis(angle = 90)
+  ) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.line.x = element_blank(), axis.line.y = element_blank(), axis.text.y = element_blank(), axis.ticks = element_blank())
+```
+
+The number of SOMAmers in each module
+```{r}
+module_size <- data.frame(table(net$colors)) %>%
+  rename(module = Var1, nMembers = Freq) %>%
+  mutate(module = paste0("ME", module)) %>%
+  filter(!module == "ME0")
+
+
+module_size <- list(
+  df = module_size,
+  plot = module_size %>%
+    ggplot(aes(x = fct_relevel(module, module_order), y = nMembers)) +
+    geom_col(aes(fill = module)) +
+    scale_fill_manual(values = module_colours) +
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_x_discrete(guide = guide_axis(angle = 90)) +
+    labs(x = NULL, y = "Module size") +
+    theme(legend.position = "none")
+)
+
+figs$module_size <- module_size$plot
+
+summary(module_size$df)
+```
+
+---
+
+# Association between modules and clinical measures
+
+```{r}
+# extract module eigengenes as a dataframe
+lm_df <- net$MEs %>%
+  rownames_to_column("study_id") %>%
+  pivot_longer(cols = !study_id, names_to = "module", values_to = "eigengene") %>%
+  # remove module 0 as these are unassigned SOMAmers
+  filter(!module == "ME0")
+
+# create a dataframe containing the clinical measures we're interested in
+traits <- meta %>% select(study_id, ref_dx, platelets, baseline_esr, baseline_crp, pmryesno, cranial_isch_comp_rm)
+# # also add on disease histology measures
+# histology <- readRDS(here("00_setup/data/meta.histology.rds")) %>%
+#   select(study_id, max_barcelona_score_recode, max_media_pattern_recode, max_media_destruction_recode, max_occlusion_grade_recode) %>%
+#   distinct()
+# traits <- traits %>% left_join(histology, by = "study_id")
+# the colnames except study id are therefore the traits being tested
+trait_list <- names(traits)
+trait_list <- trait_list[!trait_list == "study_id"]
+# fit linear model to test association between module eigengenes and each respective clinical measure
+trait_associations <- map(trait_list, \(trait) lm_df %>%
+  left_join(traits, by = "study_id") %>%
+  group_by(module) %>%
+  do(glance(lm(reformulate(termlabels = trait, response = "eigengene"), data = .)))) %>%
+  set_names(trait_list) %>%
+  list_rbind(names_to = "trait")
+# correct for multiple testing (pool results together)
+trait_associations <- trait_associations %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr"))
+```
+
+
+Asterisk indicates FDR < 0.05
+```{r fig.height=4, fig.width=9}
+figs$module_trait_associations <- trait_associations %>%
+  mutate(
+    # categorise traits for plotting
+    category = case_when(trait == "ref_dx" ~ "Diagnosis",
+      trait %in% c("platelets", "baseline_esr", "baseline_crp") ~ "Inflammatory markers",
+      trait %in% c("pmryesno", "cranial_isch_comp_rm") ~ "Clinical symptoms",
+      trait %in% c(
+        "max_barcelona_score_recode", "max_media_destruction_recode",
+        "max_media_pattern_recode", "max_occlusion_grade_recode"
+      ) ~ "Temporal artery histology",
+      .default = "no_cat"
+    ),
+    # relabel traits for plotting
+    trait = case_match(trait,
+      "ref_dx" ~ "GCA",
+      "platelets" ~ "Platelet count",
+      "baseline_esr" ~ "ESR",
+      "baseline_crp" ~ "CRP",
+      "pmryesno" ~ "PMR",
+      "cranial_isch_comp_rm" ~ "Cranial ischaemia",
+      "max_barcelona_score_recode" ~ "Hernández-Rodríguez et al",
+      "max_media_destruction_recode" ~ "Media destruction",
+      "max_media_pattern_recode" ~ "Media inflammation pattern",
+      "max_occlusion_grade_recode" ~ "Intima occlusion grade",
+      .default = trait
+    ),
+    trait = factor(trait, levels = c(
+      "GCA", "CRP", "ESR","Platelet count",
+      "PMR", "Cranial ischaemia",
+      "Hernández-Rodríguez et al", "Media destruction", "Media inflammation pattern", "Intima occlusion grade"
+    )),
+    asterisk = if_else(fdr < 0.05, "*", NA)
+  ) %>%
+  ggplot(aes(x = fct_relevel(module, module_order), y = trait)) +
+  geom_tile(aes(fill = -log10(fdr)), colour="white") +
+  geom_text(aes(label = asterisk), colour = "white", fontface = "bold", size = 5) +
+  facet_col(~ factor(category, levels = c("Diagnosis", "Inflammatory markers", "Clinical symptoms", "Temporal artery histology")), scales = "free_y", space = "free") +
+  labs(x = NULL, y = NULL, fill = "-log<sub>10</sub>(FDR <i>P</i>)") +
+  scale_y_discrete(expand = c(0, 0), limits = rev) +
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 90)) +
+  scale_fill_viridis_c(direction = 1, guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  figTheme("box")
+
+figs$module_trait_associations
+```
+
+Export trait associations for supp data
+```{r}
+trait_associations |>
+  select(trait, module,r.squared,statistic,p.value,fdr) |>
+  write_csv(here("supp_data/module_trait_lm_stats.csv"))
+```
+
+
+# ME19 + ME23
+Modules 19 and 23 are associated with CRP, ESR, platelet count and the patient diagnosis.
+
+
+Number of SOMAmers in Modules 19 and 23
+```{r}
+module_size$df %>% filter(module%in%c("ME19","ME23"))
+```
+
+
+## Visualise associations
+```{r}
+figs$module_trait_breakdown <- ((map(c("ME19","ME23"), \(module) plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = module,
+  trait = "ref_dx",
+  plotType = "category",
+  plotTitle = module
+)$plot +
+  xlab("Diagnosis") +
+  scale_colour_manual(values = col.dx) +
+  theme(legend.position = "none")
+) %>% wrap_plots(ncol = 1))|
+  (map(c("ME19","ME23"), \(module) plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = module,
+  trait = "baseline_crp",
+  plotType = "numeric",
+  plotTitle = module
+)$plot +
+  xlab("CRP (mg/L)"))) %>% wrap_plots(ncol = 1)) |
+(map(c("ME19","ME23"), \(module) plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = module,
+  trait = "baseline_esr",
+  plotType = "numeric",
+  plotTitle = module
+)$plot +
+  xlab("ESR (mm/h)")
+) %>% wrap_plots(ncol = 1)) |
+(map(c("ME19","ME23"), \(module) plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = module,
+  trait = "platelets",
+  plotType = "numeric",
+  plotTitle = module
+)$plot +
+  xlab("Platelet count (10<sup>9</sup>/L)"))) %>% wrap_plots(ncol = 1)
+figs$module_trait_breakdown
+```
+
+
+## Biological definition
+ORA of reactome terms
+
+```{r fig.height=9, fig.width=12}
+figs$module_biological_definition <- map(c("ME19","ME23"), \(x) geneset_ora$reactome %>%
+      filter(module==x, pval < 0.01) %>%
+      mutate(sig = if_else(padj<0.05,"FDR <i>P</i> < 0.05","FDR <i>P</i> > 0.05"),
+             module = x)) %>%
+  list_rbind() %>%
+  ggplot(aes(x = -log10(pval), y = fct_reorder(pathway, pval, .desc = TRUE))) +
+  geom_col(aes(fill = sig)) +
+  scale_y_discrete(labels = scales::label_wrap(40)) +
+  scale_fill_manual(values = c("FDR <i>P</i> < 0.05" = "red", "FDR <i>P</i> > 0.05" = "grey")) +
+  facet_grid(module~., scale="free_y",space="free") +
+  labs(y = NULL,x="-log<sub>10</sub>(<i>P</i>)", fill=NULL) +
+  figTheme("box") +
+  theme(legend.text = element_markdown(),
+        axis.text.y=element_text(size = 7),
+        legend.position = "bottom")
+figs$module_biological_definition
+```
+Supp data
+```{r}
+map(c("ME19","ME23"), \(x) geneset_ora$reactome %>%
+      filter(module==x)) |>
+  list_rbind() |>
+  select(-c(overlapGenes)) |>
+  write_csv(here("supp_data/module_ora.csv"))
+```
+
+
+## Connectivity
+
+Visualise most important SOMAmers in modules 19 and 23
+```{r}
+topConnectedProteins <- function(ME,nProteinLabels,proportionOfProteins,xLabel){
+  require(ggrepel)
+  df <- module_members |> filter(module==ME) |>
+    left_join(module_connectivity,by=c("apt_id", "module")) |>
+    left_join(select(protein_info,apt_id,EntrezGeneSymbol),by="apt_id") |>
+    arrange(desc(pearson)) |>
+    mutate(rank=dense_rank(desc(pearson)))
+  df |>
+    head(proportionOfProteins*nrow(df)) |>
+    ggplot(aes(x = rank,y=pearson)) +
+    geom_point(colour=module_colours[[ME]]) +
+    geom_text_repel(data=head(df,nProteinLabels),aes(label=EntrezGeneSymbol), min.segment.length = 0, max.overlaps = Inf,size=3,bg.colour = "white") +
+    labs(x = xLabel, y= paste0(ME, " connectivity"))
+}
+```
+
+```{r}
+(figs$top_module_somamers <- topConnectedProteins(ME = "ME19", nProteinLabels = 15, proportionOfProteins = 0.5,xLabel = "Ranked SOMAmers (top 50%)") +
+topConnectedProteins(ME = "ME23", nProteinLabels = 15, proportionOfProteins = 0.5,xLabel = "Ranked SOMAmers (top 50%)"))
+```
+
+
+
+
+Supp - relationship between module connectivity (correlation between protein abundance and module eigenprotein) and the association of each somamer to the trait (linear regression for gca diagnosis, spearman's rho for the rest)
+
+```{r fig.height=6, fig.width=10}
+figs$module_connectivity_trait_association <- ((map(c("ME19","ME23"), \(module) plotModuleConnectivityTrait(
+  traitResults = pluck(de, "ref_dx"),statColumn = "t",
+  connectivityDf = module_connectivity,
+  module = module,
+  plotTitle = NULL,
+  wgcnaObjectColors = net$colors)$plot +
+  xlab("GCA vs non-GCA<br>Moderated <i>t-</i>statistic")) %>% wrap_plots(ncol=1)) |
+
+(map(c("ME19","ME23"), \(module) plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_crp"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = module,
+  plotTitle = NULL,
+  wgcnaObjectColors = net$colors)$plot +
+    xlab("CRP<br>Spearman's rho")) %>% wrap_plots(ncol=1)) |
+
+(map(c("ME19","ME23"), \(module) plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_esr"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = module,
+  plotTitle = NULL,
+  wgcnaObjectColors = net$colors)$plot +
+    xlab("ESR<br>Spearman's rho")) %>% wrap_plots(ncol=1)) |
+
+(map(c("ME19","ME23"), \(module) plotModuleConnectivityTrait(
+  traitResults = pluck(de, "platelets"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = module,
+  plotTitle = NULL,
+  wgcnaObjectColors = net$colors)$plot +
+    xlab("Platelet count<br>Spearman's rho"))) %>% wrap_plots(ncol=1))
+
+figs$module_connectivity_trait_association
+```
+
+Supp data - trait association summary stats
+```{r}
+map(c("baseline_crp","baseline_esr","platelets"), \(x) pluck(de, x) |>
+      write_csv(here(paste0("supp_data/soma_spearman_",x,".csv"))))
+```
+
+
+---
+
+# Figure panel
+## Main
+```{r fig.height=12, fig.width=9}
+a <- figs$module_dendrogram /
+  figs$module_colours /
+  (figs$module_size + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())) /
+  figs$module_trait_associations + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.direction = "horizontal", legend.position = "bottom") +
+  plot_layout(heights = c(0.2, 0.035, 0.25, 0.5))
+
+wrap_plots(a, wrap_elements(full = figs$module_trait_breakdown), wrap_elements(full=figs$top_module_somamers), ncol = 1,heights = c(1.75,1.75,1))
+
+ggsave(here("figures/raw/main_proteinCoabundance.pdf"), height = 12, width = 9)
+```
+
+### Source data
+
+```{r}
+#3a
+figs$module_dendrogram$data |> write_csv(here("figures/source_data/3a.csv"))
+
+#3b
+figs$module_size$data |> write_csv(here("figures/source_data/3b.csv"))
+
+# 3c
+figs$module_trait_associations$data |> select(trait,module,p.value,fdr,category,asterisk) |> write_csv(here("figures/source_data/3c.csv"))
+
+#3d
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME19",
+  trait = "ref_dx",
+  plotType = "category",
+  plotTitle = "ME19"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3d.csv"))
+
+#3e
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME19",
+  trait = "baseline_crp",
+  plotType = "numeric",
+  plotTitle = "ME19"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3e.csv"))
+
+# 3f
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME19",
+  trait = "baseline_esr",
+  plotType = "numeric",
+  plotTitle = "ME19"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3f.csv"))
+
+# 3g
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME19",
+  trait = "platelets",
+  plotType = "numeric",
+  plotTitle = "ME19"
+)$plot$data |> select(-study_id) |>  write_csv(here("figures/source_data/3g.csv"))
+
+#3h
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME23",
+  trait = "ref_dx",
+  plotType = "category",
+  plotTitle = "ME23"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3h.csv"))
+
+#3i
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME23",
+  trait = "baseline_crp",
+  plotType = "numeric",
+  plotTitle = "ME23"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3i.csv"))
+
+#3j
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME23",
+  trait = "baseline_esr",
+  plotType = "numeric",
+  plotTitle = "ME23"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3j.csv"))
+
+#3k
+plotModuleTraitAssociation(
+  lmOutput = lm_df,
+  module = "ME23",
+  trait = "platelets",
+  plotType = "numeric",
+  plotTitle = "ME23"
+)$plot$data |> select(-study_id) |> write_csv(here("figures/source_data/3k.csv"))
+
+# 3l
+topConnectedProteins(ME = "ME19", nProteinLabels = 15, proportionOfProteins = 0.5,xLabel = "Ranked SOMAmers (top 50%)")$data |> write_csv(here("figures/source_data/3l.csv"))
+
+# 3m
+topConnectedProteins(ME = "ME23", nProteinLabels = 15, proportionOfProteins = 0.5,xLabel = "Ranked SOMAmers (top 50%)")$data |> write_csv(here("figures/source_data/3m.csv"))
+```
+
+
+## Supp
+```{r fig.height=8, fig.width=14}
+(((figs$signed_r2 | figs$mean_connectivity) / figs$module_connectivity_trait_association + plot_layout(heights = c(1,3))) |
+  figs$module_biological_definition) + plot_layout(widths = c(3.5,1))
+ggsave(here("figures/raw/supp_wgcna_supporting.pdf"), height = 8, width = 14)
+```
+
+Export  module members with colours + connectivity for supp data
+```{r}
+module_members |>
+  filter(!module=="ME0") |>
+  left_join(data.frame(module_colours) |> rownames_to_column("module") |> rename(module_colour=module_colours),by="module") |>
+  left_join(module_connectivity,by=c("apt_id","module")) |>
+  select(-pval) |>
+  rename(connectivity=pearson) |>
+  write_csv(here("supp_data/protein_module_info.csv"))
+```
+
+### Source data
+
+```{r}
+#S5a
+figs$signed_r2$data |> select(Power,model_fit) |> write_csv(here("figures/source_data/S5a.csv"))
+#S5b
+figs$mean_connectivity$data |> select(Power,mean.k.) |> write_csv(here("figures/source_data/S5b.csv"))
+
+#S5c
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "ref_dx"),statColumn = "t",
+  connectivityDf = module_connectivity,
+  module = "ME19",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,t_statistic=t,P.Value) |> write_csv(here("figures/source_data/S5c.csv"))
+#S5d
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_crp"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME19",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5d.csv"))
+#S5e
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_esr"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME19",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5e.csv"))
+#S5f
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "platelets"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME19",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5f.csv"))
+#S5g
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "ref_dx"),statColumn = "t",
+  connectivityDf = module_connectivity,
+  module = "ME23",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,t_statistic=t,P.Value) |> write_csv(here("figures/source_data/S5g.csv"))
+#S5h
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_crp"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME23",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5h.csv"))
+#S5i
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "baseline_esr"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME23",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5i.csv"))
+#S5j
+plotModuleConnectivityTrait(
+  traitResults = pluck(de, "platelets"),statColumn = "estimate",
+  connectivityDf = module_connectivity,
+  module = "ME23",
+  wgcnaObjectColors = net$colors)$plot$data |> select(apt_id,module,connectivity=pearson,spearman_rho=estimate,p.value) |> write_csv(here("figures/source_data/S5j.csv"))
+#S5k
+figs$module_biological_definition$data |> select(-c(overlapGenes,sig)) |> write_csv(here("figures/source_data/S5k.csv"))
+```

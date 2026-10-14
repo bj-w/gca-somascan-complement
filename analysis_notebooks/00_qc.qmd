@@ -1,0 +1,346 @@
+---
+title: "QC"
+author:
+  - Ben Whittle
+date: now
+date-format: DD-MM-YY HH:mm
+format:
+  html:
+    toc: true
+    toc-depth: 1
+    smooth-scroll: true
+    code-fold: false
+    fig-dpi: 300
+    embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    dev: ragg_png
+execute:
+  warning: false
+---
+
+Setup
+```{r}
+library(here)
+library(ragg)
+library(variancePartition)
+library(arrow)
+library(tidyverse)
+library(ggtext)
+require(ggrepel)
+library(broom)
+library(table1)
+library(patchwork)
+
+source(here("functions.R"))
+theme_set(figTheme())
+plots <- list()
+```
+Data import
+```{r}
+meta_pre_qc <- readRDS(here("00_setup/data/metadata.samples.preQC.rds"))
+analytes <- readRDS(here("00_setup/data/metadata.analytes.rds"))
+counts_pre_qc <- read_parquet(here("00_setup/data/count_tidy.preQC.parquet"))
+```
+
+---
+
+# Participants characteristics
+
+Prior to proteomic QC as some samples included in ELISA measurements
+
+Table 1
+```{r}
+table1(
+  x = ~ sex + age_at_dx + gc_days + baseline_crp + baseline_esr + platelets + freezer_months + cranial_isch_comp_rm + pmryesno | ref_dx,
+  data = meta_pre_qc %>%
+    mutate(
+      ref_dx = fct_recode(ref_dx, `non-GCA`="not_cGCA", GCA="cGCA"),
+      age_at_dx = setLabel(age_at_dx, "Age"),
+      sex = factor(sex, levels = c("female", "male"), labels = c("Female", "Male")),
+      sex = setLabel(sex, "Sex"),
+      freezer_months = setLabel(freezer_months, "Sample storage time (months)"),
+      gc_days = setLabel(gc_days, "Glucocorticoid treatment (days)"),
+      baseline_crp = setLabel(baseline_crp, "CRP (mg/L)"),
+      baseline_esr = setLabel(baseline_esr, "ESR (mm/h)"),
+      platelets = setLabel(platelets, "Platelet count (109/L)"),
+      cranial_isch_comp_rm = setLabel(cranial_isch_comp_rm, "Cranial ischaemia complications"),
+      pmryesno=str_to_title(pmryesno),
+      pmryesno=setLabel(pmryesno, "Polymyalgia rheumatica symptoms")
+    ),
+  overall = FALSE
+)
+```
+
+
+# Sample QC
+
+## SomaLogic QC
+One sample was flagged as the hybridisation scale factor (7.76)
+was outside of 0.4-2.5 range due to a leak - therefore removed
+prior to analysis.
+
+```{r}
+meta_pre_qc %>% filter(row_check == "FLAG") |> pull(ref_dx)
+```
+One sample, was flagged as the median normalisation scale factor
+for the 20x dilution group (0.39118298) was outside the range of 0.4-2.5. Given
+the scale factor is just under the threshold I'll keep an eye on it during the
+qc.
+
+## Sample outlier detection.
+Outlier samples were detected using two complementary methods.
+```{r}
+outliers <- list()
+outliers$pca <- readRDS(here("00_setup/data/qc/outlier.pca.rds"))
+outliers$median_iqr <- readRDS(here("00_setup/data/qc/outlier.median_iqr.rds"))
+```
+The PCA method highlights samples +/- 5 standard deviations from the mean PC1
+and PC2 values.
+The Median+IQR method identifies samples +/- 5 standard deviations from the mean
+abundance medians and IQRs.
+Then I identify samples flagged by either of these methods to exclude.
+
+```{r fig.height=4, fig.width=7}
+plots$sample_outliers <- outliers$pca$plot + outliers$median_iqr$plot + theme(legend.position = "none") &
+  #plot_layout(guides = "collect") &
+  theme(legend.title = element_blank())
+plots$sample_outliers
+```
+How many samples are flagged by either method?
+```{r}
+union(outliers$pca$outliers, outliers$median_iqr$outliers) |> length()
+```
+This samples was removed from the post QC metadata and counts.
+```{r}
+meta <- readRDS(here("00_setup/data/metadata.samples.postQC.rds"))
+counts <- read_parquet(here("00_setup/data/count_tidy.postQC.parquet"))
+```
+
+
+---
+
+# Aptamer QC
+### Descriptive statistics
+How many usable SOMAmers on the array?
+
+```{r}
+length(unique(analytes$apt_id))
+length(unique(analytes$Target))
+length(unique(analytes$UniProt))
+length(unique(analytes$EntrezGeneSymbol))
+```
+
+Targets with multiple aptamers
+```{r}
+analytes %>%
+  select(SeqId, Target) %>%
+  mutate(freq = n(), .by = Target) %>%
+  select(Target, freq) %>%
+  distinct() %>%
+  arrange(desc(freq))
+```
+Number of flagged aptamers
+```{r}
+table(analytes$ColCheck)
+```
+
+:::{.callout-note}
+SOMAmers In Tails refers to the cumulative number of SOMAmer reagents in the QC
+control with a ratio on any plate outside the accepted accuracy range, 0.8 - 1.2,
+when compared to the reference. Flagged SOMAmer reagents are typically retained
+for analyses since accuracy across all assay runs is a robust quality metric but
+is not a requirement for identification of meaningful biological signal.
+:::
+
+
+### Estimated limit of detection (eLOD)
+eLOD calculated using `SomaDataIO::calc_eLOD`.
+First calculate the adjusted median absolute deviation (MAD) (1.4826 x MAD),
+Then for each SOMAmer, eLOD = median + 3.3 x adjusted MAD
+```{r fig.height=3, fig.width=4.5}
+elod <- read_parquet(here("00_setup/data/qc/elod.parqet"))
+plots$elod <- elod %>%
+  ggplot(aes(x = prop)) +
+  geom_histogram(colour = "black", fill = "grey75") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.21))) +
+  labs(y = "Number of samples", x = "SOMAmers above estimated limit of detection")
+plots$elod
+min(elod$prop)
+```
+
+# Sample and SOMAmer outlier plots
+```{r fig.height=5, fig.width=6}
+plots$sample_outliers / plots$elod + plot_layout(heights = c(2, 1)) + plot_annotation(tag_levels = "a") & theme(plot.margin = unit(c(5, 6, 5, 5), "pt"), legend.position = "bottom")
+ggsave(here("figures/annotated/supp_outliers_sample_SOMAmer.png"),
+  height = 5, width = 6,device=agg_png,dpi=600
+)
+```
+
+
+---
+
+# PCA
+Import SOMAmer log2 RFU PCs
+```{r}
+prcomp_obj <- readRDS(here("00_setup/data/qc/prcompObject_postQC.rds"))
+```
+
+Screeplot
+```{r fig.height=3, fig.width=8}
+pc_prop_explain <- summary(prcomp_obj)[["importance"]][2, ] %>%
+  data.frame(prop_explained = .) %>%
+  rownames_to_column("pc")
+screeplot <- pc_prop_explain %>%
+  ggplot(aes(x = fct_reorder(pc, prop_explained, .desc = TRUE), y = prop_explained * 100)) +
+  geom_col(fill = "grey80", colour = "black") +
+  labs(x = "PCs", y = "Variance explained (%)") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+# just first 10 PCs
+inset <- pc_prop_explain %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = fct_reorder(pc, prop_explained, .desc = TRUE), y = prop_explained * 100)) +
+  geom_col(fill = "grey80", colour = "black") +
+  labs(x = NULL, y = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+screeplot + inset_element(inset, 0.3, 0.3, 1, 1)
+```
+PC1 can explain `r round(pc_prop_explain[1, 2], 2)*100`% of aptamer abundance variation.
+
+Visualise PCA
+
+```{r fig.height=3, fig.width=5}
+(plots$pca_biplot_refdx <- plotPCABiplot(prcompObject = prcomp_obj,
+              metadata = mutate(meta, ref_dx = case_match(ref_dx, "not_cGCA" ~ "non-GCA", "cGCA"~"GCA", .default = ref_dx)),
+              color_var = "ref_dx",
+              x_pc = "PC1", y_pc = "PC2",
+              sample_id_col = "study_id",
+              marginalDensity = TRUE) +
+  scale_fill_manual(values = col.dx) +
+  labs(fill = "Diagnosis"))
+```
+PC2 is associated with reference diagnosis
+```{r}
+# pull out PC1 and PC2 scores, add on ref dx and then make tidy
+plots$pc_boxplot_refdx <- as.data.frame(prcomp_obj$x) %>%
+  rownames_to_column("study_id") %>%
+  left_join(meta, by = "study_id") %>%
+  pivot_longer(cols = c(PC1, PC2), names_to = "PC1_PC2", values_to = "score")
+# plot
+plots$pc_boxplot_refdx <- plots$pc_boxplot_refdx %>%
+  mutate(ref_dx = case_match(ref_dx, "not_cGCA" ~ "non-GCA", "cGCA"~"GCA", .default = ref_dx)) %>%
+  ggplot(aes(x = ref_dx, y = score)) +
+  geom_boxplot(aes(fill = ref_dx), width = 0.2) +
+  facet_wrap(~PC1_PC2, scale = "free") +
+  # run linear regression and beta and p values to plot
+  geom_richtext(
+    data = plots$pc_boxplot_refdx %>%
+      group_by(PC1_PC2) %>%
+      do(tidy(lm(reformulate(termlabels = "ref_dx", response = "score"), data = .))) %>%
+      filter(term == "ref_dxcGCA") %>%
+      mutate(pval_lab = map_chr(p.value, formatPvalLabel)),
+    aes(x = 1.5, y = Inf, vjust = 1, label = paste0("β = ", round(estimate, 2), "<br>", pval_lab)),
+    size = 3, fill = NA, label.color = NA
+  ) +
+  scale_fill_manual(values = col.dx) +
+  labs(x = NULL, y = "PC score") +
+  theme(legend.position = "none")
+
+plots$pc_boxplot_refdx
+```
+
+---
+
+# Covariates
+
+### PCA
+Here, I am using univariate linear regression to test the association between abundance PCs and potential sources of variation (biological and technical).
+
+Import PCA covariate analysis
+```{r fig.height=4, fig.width=6}
+pca_assoc <- readRDS(here("00_setup/data/qc/pca_covariate_associations.rds"))
+(plots$pca_assoc <- plotlmPCA(lmPCA_output =  mutate(pca_assoc,metric = str_replace(metric, "RFU", "RFU ANML"))))
+```
+Only values with FDR <0.05 are shown.
+
+Cumulative explainable variance % for first 10 PCs
+```{r}
+summary(prcomp_obj)[["importance"]][3,][10]*100
+```
+
+
+Site cannot be used as not all C-GCA and Not C-CGA participants originated from all sites
+```{r}
+meta %>%
+  summarise(n = n(), .by = c(ref_dx, site)) %>%
+  pivot_wider(id_cols = site, names_from = ref_dx, values_from = n)
+```
+
+
+# Variance partition
+```{r}
+var_part <- readRDS(here("00_setup/data/qc/variancePartition.rds"))
+```
+Plot
+```{r fig.height=4,fig.width=5}
+plots$variancePartition <- as.data.frame(var_part) %>%
+  rownames_to_column("apt_id") %>%
+  pivot_longer(cols=!apt_id, names_to = "variable", values_to = "prop") %>%
+  mutate(variable = case_match(variable,
+                               "gc_days" ~ "Glucocorticoid treatment duration",
+                               "age_at_dx" ~ "Age",
+                               "sex" ~ "Sex",
+                               "ref_dx" ~ "Diagnosis",
+                               .default = variable)) %>%
+  ggplot(aes(x = prop*100, y = fct_reorder(variable, prop, median))) +
+  geom_boxplot() +
+  scale_y_discrete(labels = c("age_at_dx" ="Age",
+                               "sex" = "Sex",
+                               "ref_dx" = "Diagnosis",
+                               "iqr_log2_RFU" = "IQR log2 RFU ANML",
+                              "gc_days" = "Glucocorticoid treatment duration")) +
+  labs(x = "Variance explained (%)", y = NULL)
+
+plots$variancePartition
+```
+
+---
+# Panel
+```{r fig.height=12, fig.width=9}
+wrap_elements(full = plots$pca_biplot_refdx + plots$pc_boxplot_refdx) /
+plots$pca_assoc /
+  wrap_elements(full = plots$variancePartition) +
+  plot_layout(heights = c(1, 1, 1.5))
+
+ggsave(here("figures/raw/supp_variation_sources.pdf"),
+       height = 12, width = 9)
+```
+
+### Source data
+```{r}
+
+#S1a
+outliers$pca$plot$data |> select(PC1,PC2,outlier) |> write_csv(here("figures/source_data/S1a.csv"))
+
+#S1b
+outliers$median_iqr$data |> select(median,iqr,outlier) |> write_csv(here("figures/source_data/S1b.csv"))
+
+#S1c
+plots$elod$data |> select(prop_above_eLOD = prop) |> write_csv(here("figures/source_data/S1c.csv"))
+
+#S9a_b
+plots$pca_biplot_refdx$data |> select(PC1, PC2, ref_dx) |> write_csv(here("figures/source_data/S9a_b.csv"))
+
+
+#S9c
+mutate(pca_assoc,metric = str_replace(metric, "RFU", "RFU ANML")) |>
+  select(PC=pc,metric,r.squared,p.value,prop_explained) |> write_csv(here("figures/source_data/S9c.csv"))
+
+#S9d
+plots$variancePartition$data |> write_csv(here("figures/source_data/S9d.csv"))
+```
